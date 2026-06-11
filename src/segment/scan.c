@@ -68,6 +68,261 @@ tp_segment_read_skip_entry(
 }
 
 /*
+ * Read a V6 skip entry by block index, including the position_offset
+ * that is normally discarded when widening to TpSkipEntry.
+ */
+void
+tp_segment_read_skip_entry_v6(
+		TpSegmentReader *reader,
+		uint64			 skip_index_offset,
+		uint32			 block_idx,
+		TpSkipEntry		*skip,
+		uint64			*position_offset)
+{
+	uint64 skip_offset;
+	TpSkipEntryV6 v6;
+
+	if (position_offset != NULL)
+		*position_offset = 0;
+
+	if (reader->segment_version < TP_SEGMENT_FORMAT_VERSION_6)
+	{
+		tp_segment_read_skip_entry(
+				reader, skip_index_offset, block_idx, skip);
+		return;
+	}
+
+	skip_offset = skip_index_offset +
+				  (uint64)block_idx * sizeof(TpSkipEntryV6);
+	tp_segment_read(reader, skip_offset, &v6, sizeof(TpSkipEntryV6));
+	skip->last_doc_id	   = v6.last_doc_id;
+	skip->doc_count		   = v6.doc_count;
+	skip->block_max_tf	   = v6.block_max_tf;
+	skip->block_max_norm   = v6.block_max_norm;
+	skip->posting_offset   = v6.posting_offset;
+	skip->flags			   = v6.flags;
+	memcpy(skip->reserved, v6.reserved, sizeof(v6.reserved));
+	if (position_offset != NULL)
+		*position_offset = v6.position_offset;
+}
+
+/*
+ * Decode a variable-length integer from a segment.
+ * Advances *offset_past by the number of bytes consumed.
+ * Returns the decoded uint32 value.
+ */
+static uint32
+tp_read_varint(TpSegmentReader *reader, uint64 *offset_p)
+{
+	uint8  buf[5];
+	uint32 value = 0;
+	int    shift = 0;
+	int    i;
+
+	for (i = 0; i < 5; i++)
+	{
+		tp_segment_read(reader, (*offset_p) + i, &buf[i], 1);
+		value |= ((uint32)(buf[i] & 0x7F)) << shift;
+		if ((buf[i] & 0x80) == 0)
+		{
+			*offset_p += i + 1;
+			return value;
+		}
+		shift += 7;
+	}
+	/* Should not reach here for valid uint32 varints */
+	*offset_p += 5;
+	return value;
+}
+
+/*
+ * Read positions for a specific doc within a block's position stream.
+ *
+ * Each doc in the block has:
+ *   [varint: position_count][varint delta-encoded positions...]
+ * This function skips past earlier docs to reach the target doc.
+ *
+ * Returns true on success, false if target_in_block_idx >= doc_count.
+ * On success, caller must pfree(*positions_out).
+ */
+bool
+tp_segment_read_block_positions(
+		TpSegmentReader *reader,
+		uint64			 position_offset,
+		uint32			 doc_count,
+		uint32			 target_in_block_idx,
+		uint16			**positions_out,
+		uint32			*position_count_out)
+{
+	uint64 offset = position_offset;
+	uint32 d;
+
+	if (position_offset == 0 || target_in_block_idx >= doc_count)
+		return false;
+
+	/* Skip past earlier docs */
+	for (d = 0; d <= target_in_block_idx; d++)
+	{
+		uint32 pc = tp_read_varint(reader, &offset);
+
+		if (d < target_in_block_idx)
+		{
+			/* Skip positions for this doc */
+			uint32 p;
+			(void)pc; /* only used for target doc */
+			for (p = 0; p < pc; p++)
+				(void)tp_read_varint(reader, &offset);
+		}
+		else
+		{
+			/* Target doc: read positions */
+			uint16 prev = 0;
+			uint32 p;
+
+			*position_count_out = pc;
+			if (pc == 0)
+			{
+				*positions_out = NULL;
+				return true;
+			}
+			*positions_out = palloc(pc * sizeof(uint16));
+			for (p = 0; p < pc; p++)
+			{
+				uint16 delta = (uint16)tp_read_varint(reader, &offset);
+				prev		 = prev + delta;
+				(*positions_out)[p] = prev;
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Get positions for a term+doc_id from a V6 segment.
+ *
+ * Finds the block containing doc_id via binary search of skip entries,
+ * then reads positions for that doc within the block.
+ *
+ * Returns true on success. Caller must pfree(*positions_out) on success.
+ * Returns false if segment is not V6, term not found, doc_id not found,
+ * or no positions exist.
+ */
+bool
+tp_segment_get_term_positions(
+		TpSegmentReader *reader,
+		TpDictEntry		*dict_entry,
+		uint32			 doc_id,
+		uint16			**positions_out,
+		uint32			*position_count_out)
+{
+	int left, right, mid;
+
+	if (reader->segment_version < TP_SEGMENT_FORMAT_VERSION_6)
+		return false;
+	if (reader->v6_data == NULL)
+		return false;
+	/* Check capability flag */
+	if ((reader->v6_data[1] & TP_SEGMENT_FLAG_HAS_POSITIONS) == 0)
+		return false;
+
+	if (dict_entry->block_count == 0)
+		return false;
+
+	/* Binary search skip entries to find the block containing doc_id */
+	left  = 0;
+	right = dict_entry->block_count - 1;
+
+	while (left <= right)
+	{
+		TpSkipEntry sk;
+		uint64		pos_off = 0;
+
+		mid = left + (right - left) / 2;
+		tp_segment_read_skip_entry_v6(
+				reader, dict_entry->skip_index_offset, mid, &sk, &pos_off);
+
+		/* Each block stores doc_ids in ascending order.
+		 * The last_doc_id is the max doc_id in that block.
+		 * If doc_id <= last_doc_id, the doc might be in this
+		 * block or an earlier one.  But since we binary search
+		 * and doc_ids across blocks are strictly increasing
+		 * (block i's max < block i+1's min), the condition
+		 * doc_id <= last_doc_id suffices for finding the block.
+		 *
+		 * Actually, we need the block whose doc_count > 0 and
+		 * covers doc_id.  Since skip entries only have last_doc_id
+		 * (not first_doc_id), we bisect: find first block where
+		 * last_doc_id >= doc_id.
+		 */
+		if (sk.last_doc_id < doc_id)
+		{
+			left = mid + 1;
+		}
+		else
+		{
+			right = mid - 1;
+		}
+	}
+
+	if (left >= (int)dict_entry->block_count)
+		return false;
+
+	{
+		TpSkipEntry sk;
+		uint64		pos_off = 0;
+
+		tp_segment_read_skip_entry_v6(
+				reader,
+				dict_entry->skip_index_offset,
+				(uint32)left,
+				&sk,
+				&pos_off);
+
+		if (pos_off == 0)
+			return false;
+
+		/*
+		 * Now we need to find the doc's position within this block.
+		 * Read the block's posting data to find the in-block index.
+		 */
+		{
+			TpBlockPosting *bps;
+			uint32			b;
+			int				target_idx = -1;
+
+			bps = palloc(sk.doc_count * sizeof(TpBlockPosting));
+			tp_segment_read(
+					reader,
+					sk.posting_offset,
+					bps,
+					sk.doc_count * sizeof(TpBlockPosting));
+
+			for (b = 0; b < sk.doc_count; b++)
+			{
+				if (bps[b].doc_id == doc_id)
+				{
+					target_idx = b;
+					break;
+				}
+			}
+			pfree(bps);
+
+			if (target_idx < 0)
+				return false;
+
+			return tp_segment_read_block_positions(
+					reader,
+					pos_off,
+					sk.doc_count,
+					(uint32)target_idx,
+					positions_out,
+					position_count_out);
+		}
+	}
+}
+
+/*
  * Initialize iterator for a specific term in a segment.
  * Returns true if term found, false otherwise.
  */
@@ -92,6 +347,7 @@ tp_segment_posting_iterator_init(
 	iter->term			   = term;
 	iter->current_block	   = 0;
 	iter->current_in_block = 0;
+	iter->current_position_offset = 0;
 	iter->initialized	   = false;
 	iter->finished		   = true;
 	iter->block_postings   = NULL;
@@ -217,14 +473,16 @@ tp_segment_posting_iterator_load_block(TpSegmentPostingIterator *iter)
 	}
 
 	/* Read skip entry: use cache if available, else read from disk */
+	iter->current_position_offset = 0;
 	if (iter->cached_skip_entries)
 		iter->skip_entry = iter->cached_skip_entries[iter->current_block];
 	else
-		tp_segment_read_skip_entry(
+		tp_segment_read_skip_entry_v6(
 				iter->reader,
 				iter->dict_entry.skip_index_offset,
 				iter->current_block,
-				&iter->skip_entry);
+				&iter->skip_entry,
+				&iter->current_position_offset);
 
 	block_size	= iter->skip_entry.doc_count;
 	block_bytes = block_size * sizeof(TpBlockPosting);

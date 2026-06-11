@@ -166,6 +166,9 @@ typedef struct TpSegmentPostingIterator
 	uint32		current_in_block; /* Position within current block */
 	TpSkipEntry skip_entry;		  /* Current block's skip entry */
 
+	/* V6: offset to position data for current block (0 if not V6) */
+	uint64 current_position_offset;
+
 	/* Zero-copy block access (preferred path) */
 	TpSegmentDirectAccess block_access;
 	bool				  has_block_access;
@@ -206,6 +209,31 @@ extern void tp_segment_read_skip_entry(
 		uint64			 skip_index_offset,
 		uint32			 block_idx,
 		TpSkipEntry		*skip);
+
+/* Read a V6 skip entry (includes position_offset) */
+extern void tp_segment_read_skip_entry_v6(
+		TpSegmentReader *reader,
+		uint64			 skip_index_offset,
+		uint32			 block_idx,
+		TpSkipEntry		*skip,
+		uint64			*position_offset);
+
+/* Read positions for a specific doc within a block's position stream */
+extern bool tp_segment_read_block_positions(
+		TpSegmentReader *reader,
+		uint64			 position_offset,
+		uint32			 doc_count,
+		uint32			 target_in_block_idx,
+		uint16			**positions_out,
+		uint32			*position_count_out);
+
+/* Get positions for a term+doc_id from a V6 segment */
+extern bool tp_segment_get_term_positions(
+		TpSegmentReader *reader,
+		TpDictEntry		*dict_entry,
+		uint32			 doc_id,
+		uint16			**positions_out,
+		uint32			*position_count_out);
 
 /* Seek iterator to target doc ID (for WAND algorithm) */
 extern bool tp_segment_posting_iterator_seek(

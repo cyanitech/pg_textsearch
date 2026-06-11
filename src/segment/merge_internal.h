@@ -62,6 +62,8 @@ typedef struct TpMergePostingInfo
 	uint32			old_doc_id; /* Doc ID in source segment */
 	uint16			frequency;	/* Term frequency */
 	uint8			fieldnorm;	/* Encoded fieldnorm (1 byte) */
+	uint16		   *positions;	/* V6: term positions (palloc'd, or NULL) */
+	uint32			position_count; /* V6: number of positions */
 } TpMergePostingInfo;
 
 /*
@@ -82,6 +84,9 @@ typedef struct TpPostingMergeSource
 	TpSkipEntry		skip_entry;		   /* Current block's skip entry */
 	TpBlockPosting *block_postings;	   /* Cached postings for block */
 	uint32			block_capacity;	   /* Allocated size */
+
+	/* V6: current block's position offset (0 if not V6 or no positions) */
+	uint64 current_position_offset;
 } TpPostingMergeSource;
 
 /*
@@ -102,6 +107,7 @@ typedef struct MergeTermBlockInfo
 	uint32 block_count;		 /* Number of blocks for this term */
 	uint32 doc_freq;		 /* Document frequency */
 	uint32 skip_entry_start; /* Index into skip entries array */
+	uint64 *position_offsets; /* V6: per-block position offsets (palloc'd) */
 } MergeTermBlockInfo;
 
 /* Forward declaration */

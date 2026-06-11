@@ -357,6 +357,51 @@ merged_term_add_segment_ref(
 }
 
 /*
+ * Decode a varint from a block position stream.
+ * Advances *offset past the consumed bytes.
+ */
+static uint32
+merge_read_varint(
+		TpSegmentReader *reader, uint64 *offset_p, uint64 limit)
+{
+	uint8  buf[5];
+	uint32 value = 0;
+	int    shift = 0;
+	int    i;
+
+	for (i = 0; i < 5 && (*offset_p + i) < limit; i++)
+	{
+		tp_segment_read(reader, (*offset_p) + i, &buf[i], 1);
+		value |= ((uint32)(buf[i] & 0x7F)) << shift;
+		if ((buf[i] & 0x80) == 0)
+		{
+			*offset_p += i + 1;
+			return value;
+		}
+		shift += 7;
+	}
+	*offset_p += i;
+	return value;
+}
+
+/*
+ * Encode a uint32 as a varint for writing position data.
+ * Returns number of bytes written to out.
+ */
+static size_t
+merge_write_varint_encode(uint32 v, uint8 *out)
+{
+	size_t n = 0;
+	while (v > 127)
+	{
+		out[n++] = (uint8)(v & 0x7F) | 0x80;
+		v >>= 7;
+	}
+	out[n++] = (uint8)(v & 0x7F);
+	return n;
+}
+
+/*
  * Load the next block of postings for merge source.
  * Returns true if a block was loaded, false if no more blocks remain.
  */
@@ -366,12 +411,14 @@ posting_source_load_block(TpPostingMergeSource *ps)
 	if (ps->current_block >= ps->block_count)
 		return false;
 
-	/* Read skip entry for current block (version-aware) */
-	tp_segment_read_skip_entry(
+	/* Read skip entry for current block (version-aware, V6 with positions) */
+	ps->current_position_offset = 0;
+	tp_segment_read_skip_entry_v6(
 			ps->reader,
 			ps->skip_index_offset,
 			ps->current_block,
-			&ps->skip_entry);
+			&ps->skip_entry,
+			&ps->current_position_offset);
 
 	/*
 	 * Ensure we have enough buffer space. We reuse the buffer between blocks,
@@ -460,11 +507,65 @@ posting_source_convert_current(TpPostingMergeSource *ps)
 				sizeof(OffsetNumber));
 	}
 
+	/* Free previous position data if any */
+	if (ps->current.positions != NULL)
+	{
+		pfree(ps->current.positions);
+		ps->current.positions = NULL;
+	}
+
 	/* Build output posting info */
 	ItemPointerSet(&ps->current.ctid, page, offset);
 	ps->current.old_doc_id = bp->doc_id;
 	ps->current.frequency  = bp->frequency;
 	ps->current.fieldnorm  = bp->fieldnorm;
+	ps->current.positions  = NULL;
+	ps->current.position_count = 0;
+
+	/*
+	 * V6: Read positions for this doc from the block's position stream.
+	 * Each doc's position data is: [varint count][varint delta-positions...]
+	 */
+	if (ps->current_position_offset > 0 &&
+		ps->reader->v6_data != NULL &&
+		(ps->reader->v6_data[1] & TP_SEGMENT_FLAG_HAS_POSITIONS))
+	{
+		uint64 off = ps->current_position_offset;
+		uint32 d;
+
+		/* Skip past earlier docs to find this doc's positions */
+		for (d = 0; d <= ps->current_in_block; d++)
+		{
+			uint32 pc = merge_read_varint(ps->reader, &off, UINT64_MAX);
+
+			if (d < ps->current_in_block)
+			{
+				/* Skip this doc's positions */
+				uint32 p;
+				for (p = 0; p < pc; p++)
+					(void)merge_read_varint(ps->reader, &off, UINT64_MAX);
+			}
+			else
+			{
+				/* This is our doc */
+				ps->current.position_count = pc;
+				if (pc > 0)
+				{
+					uint16 prev = 0;
+					uint32 p;
+
+					ps->current.positions = palloc(pc * sizeof(uint16));
+					for (p = 0; p < pc; p++)
+					{
+						uint16 delta = (uint16)merge_read_varint(
+								ps->reader, &off, UINT64_MAX);
+						prev = prev + delta;
+						ps->current.positions[p] = prev;
+					}
+				}
+			}
+		}
+	}
 }
 
 /*
@@ -482,6 +583,7 @@ posting_source_init(
 	ps->current_in_block  = 0;
 	ps->block_postings	  = NULL;
 	ps->block_capacity	  = 0;
+	ps->current_position_offset = 0;
 	ps->exhausted		  = (entry->block_count == 0);
 
 	if (!ps->exhausted)
@@ -513,6 +615,7 @@ posting_source_init_fast(
 	ps->current_in_block  = 0;
 	ps->block_postings	  = NULL;
 	ps->block_capacity	  = 0;
+	ps->current_position_offset = 0;
 	ps->exhausted		  = (entry->block_count == 0);
 
 	if (!ps->exhausted)
@@ -533,6 +636,11 @@ posting_source_free(TpPostingMergeSource *ps)
 		pfree(ps->block_postings);
 		ps->block_postings = NULL;
 	}
+	if (ps->current.positions)
+	{
+		pfree(ps->current.positions);
+		ps->current.positions = NULL;
+	}
 }
 
 /*
@@ -543,6 +651,14 @@ posting_source_advance(TpPostingMergeSource *ps)
 {
 	if (ps->exhausted)
 		return false;
+
+	/* Free previous position data before moving on */
+	if (ps->current.positions)
+	{
+		pfree(ps->current.positions);
+		ps->current.positions = NULL;
+		ps->current.position_count = 0;
+	}
 
 	ps->current_in_block++;
 
@@ -576,6 +692,14 @@ posting_source_advance_fast(TpPostingMergeSource *ps)
 {
 	if (ps->exhausted)
 		return false;
+
+	/* Free previous position data before moving on */
+	if (ps->current.positions)
+	{
+		pfree(ps->current.positions);
+		ps->current.positions = NULL;
+		ps->current.position_count = 0;
+	}
 
 	ps->current_in_block++;
 
@@ -965,10 +1089,71 @@ free_term_posting_sources(TpPostingMergeSource *psources, int num_psources)
  */
 
 /*
+ * Helper: write position data for a merged block.
+ *
+ * Each doc gets: varint position_count followed by delta-encoded positions.
+ * Returns the offset where position data was written.
+ * If no positions exist for any doc, returns sink->current_offset
+ * (no data written).
+ */
+static uint64
+merge_write_block_positions(
+		TpMergeSink	   *sink,
+		TpBlockPosting *block_buf,
+		uint32			block_count,
+		uint16		   **position_arrays,
+		uint32			*position_counts)
+{
+	uint64 pos_off = sink->current_offset;
+	uint32 j;
+	bool   any_positions = false;
+
+	for (j = 0; j < block_count; j++)
+	{
+		if (position_counts != NULL && position_counts[j] > 0)
+			any_positions = true;
+	}
+
+	if (!any_positions)
+		return pos_off; /* no position data written */
+
+	for (j = 0; j < block_count; j++)
+	{
+		uint32  pc = (position_counts != NULL) ? position_counts[j] : 0;
+		uint16 *pos = (position_arrays != NULL) ? position_arrays[j] : NULL;
+		uint8   varint_buf[16];
+		size_t  vl;
+
+		/* Position count varint */
+		vl = merge_write_varint_encode(pc, varint_buf);
+		merge_sink_write(sink, varint_buf, vl);
+
+		if (pc > 0 && pos != NULL)
+		{
+			uint16 prev = 0;
+			uint32 p;
+
+			for (p = 0; p < pc; p++)
+			{
+				uint16 delta = pos[p] - prev;
+				prev = pos[p];
+				vl	 = merge_write_varint_encode(delta, varint_buf);
+				merge_sink_write(sink, varint_buf, vl);
+			}
+		}
+	}
+
+	return pos_off;
+}
+
+/*
  * Write a merged segment to pages via sink.
  *
  * Layout: [header] -> [dictionary] -> [postings] -> [skip index] ->
  *         [fieldnorm] -> [ctid map]
+ *
+ * When any source segment is V6 with positions, the output is also V6
+ * with full position data.  Otherwise V5 output is produced.
  *
  * Also writes page index and backpatches header with
  * num_pages/page_index. Caller reads sink->writer.pages[0] for root.
@@ -998,6 +1183,9 @@ write_merged_segment_to_sink(
 	uint32		 skip_entries_count;
 	uint32		 skip_entries_capacity;
 
+	/* V6 output flag */
+	bool is_v6_output = false;
+
 	if (num_terms == 0)
 		return;
 
@@ -1023,10 +1211,28 @@ write_merged_segment_to_sink(
 		return;
 	}
 
+	/* Detect V6: if any source segment has positions, write V6 output */
+	{
+		int s;
+		for (s = 0; s < num_sources; s++)
+		{
+			TpSegmentReader *r = sources[s].reader;
+			if (r != NULL && r->segment_version >= TP_SEGMENT_FORMAT_VERSION_6 &&
+				r->v6_data != NULL &&
+				(r->v6_data[1] & TP_SEGMENT_FLAG_HAS_POSITIONS))
+			{
+				is_v6_output = true;
+				break;
+			}
+		}
+	}
+
 	/* Prepare header placeholder */
 	memset(&header, 0, sizeof(TpSegmentHeader));
 	header.magic		= TP_SEGMENT_MAGIC;
-	header.version		= TP_SEGMENT_FORMAT_VERSION;
+	header.version		= is_v6_output
+						? TP_SEGMENT_FORMAT_VERSION_6
+						: TP_SEGMENT_FORMAT_VERSION;
 	header.created_at	= GetCurrentTimestamp();
 	header.num_pages	= 0;
 	header.num_terms	= num_terms;
@@ -1036,11 +1242,33 @@ write_merged_segment_to_sink(
 	header.total_tokens = total_tokens;
 	header.page_index	= InvalidBlockNumber;
 
-	/* Write placeholder header */
-	merge_sink_write(sink, &header, sizeof(TpSegmentHeader));
-
-	/* Dictionary immediately follows header */
-	header.dictionary_offset = sink->current_offset;
+	/* Write placeholder header (V6 or V5) */
+	if (is_v6_output)
+	{
+		TpSegmentHeaderV6 v6_header;
+		memset(&v6_header, 0, sizeof(v6_header));
+		v6_header.magic				= header.magic;
+		v6_header.version			= header.version;
+		v6_header.created_at		= header.created_at;
+		v6_header.num_pages			= header.num_pages;
+		v6_header.num_terms			= header.num_terms;
+		v6_header.level				= header.level;
+		v6_header.next_segment		= header.next_segment;
+		v6_header.num_docs			= header.num_docs;
+		v6_header.total_tokens		= header.total_tokens;
+		v6_header.page_index		= header.page_index;
+		v6_header.capability_flags	= TP_SEGMENT_FLAG_HAS_POSITIONS;
+		v6_header.positions_offset	= 0; /* backpatched later */
+		/* Set dictionary_offset for V6 header size */
+		v6_header.dictionary_offset = sizeof(TpSegmentHeaderV6);
+		header.dictionary_offset	= sizeof(TpSegmentHeaderV6);
+		merge_sink_write(sink, &v6_header, sizeof(TpSegmentHeaderV6));
+	}
+	else
+	{
+		header.dictionary_offset = sizeof(TpSegmentHeader);
+		merge_sink_write(sink, &header, sizeof(TpSegmentHeader));
+	}
 
 	/* Write dictionary header */
 	memset(&dict, 0, sizeof(dict));
@@ -1090,14 +1318,20 @@ write_merged_segment_to_sink(
 
 	skip_entries_capacity = 1024;
 	skip_entries_count	  = 0;
-	all_skip_entries = palloc(skip_entries_capacity * sizeof(TpSkipEntry));
+	all_skip_entries = palloc(skip_entries_capacity *
+			(is_v6_output ? sizeof(TpSkipEntryV6) : sizeof(TpSkipEntry)));
 
 	/*
 	 * Helper macro: flush a full or partial block_buf to the sink.
 	 * Computes skip entry, optionally compresses, writes data,
 	 * and accumulates the skip entry.
+	 *
+	 * V6: If position_arrays/position_counts are non-NULL,
+	 * position data is also written before the skip entry accumulation.
+	 * position_off_out receives the position section offset.
 	 */
-#define FLUSH_BLOCK(block_buf, block_count, num_blocks)                         \
+#define FLUSH_BLOCK(block_buf, block_count, num_blocks,					\
+					pos_arrays, pos_counts, pos_off_out)				\
 	do                                                                          \
 	{                                                                           \
 		TpSkipEntry skip_;                                                      \
@@ -1141,14 +1375,48 @@ write_merged_segment_to_sink(
 					(block_count) * sizeof(TpBlockPosting));                    \
 		}                                                                       \
                                                                                 \
-		if (skip_entries_count >= skip_entries_capacity)                        \
+		/* V6: write position data for this block after postings */             \
+		if (is_v6_output && (pos_arrays) != NULL && (pos_counts) != NULL)       \
 		{                                                                       \
-			skip_entries_capacity *= 2;                                         \
-			all_skip_entries = repalloc_huge(                                   \
-					all_skip_entries,                                           \
-					skip_entries_capacity * sizeof(TpSkipEntry));               \
+			*(pos_off_out) = merge_write_block_positions(                       \
+					sink, (block_buf), (block_count),                           \
+					(pos_arrays), (pos_counts));                                \
 		}                                                                       \
-		all_skip_entries[skip_entries_count++] = skip_;                         \
+                                                                                \
+		if (is_v6_output)                                                       \
+		{                                                                       \
+			TpSkipEntryV6 *v6_entries = (TpSkipEntryV6 *)all_skip_entries;      \
+			TpSkipEntryV6  v6_skip;                                             \
+                                                                                \
+			if (skip_entries_count >= skip_entries_capacity)                    \
+			{                                                                   \
+				skip_entries_capacity *= 2;                                     \
+				v6_entries = repalloc_huge(                                     \
+						v6_entries,                                             \
+						skip_entries_capacity * sizeof(TpSkipEntryV6));         \
+				all_skip_entries = (TpSkipEntry *)v6_entries;                   \
+			}                                                                   \
+			memset(&v6_skip, 0, sizeof(v6_skip));                               \
+			v6_skip.last_doc_id	   = skip_.last_doc_id;                         \
+			v6_skip.doc_count	   = skip_.doc_count;                            \
+			v6_skip.block_max_tf   = skip_.block_max_tf;                        \
+			v6_skip.block_max_norm = skip_.block_max_norm;                      \
+			v6_skip.posting_offset = skip_.posting_offset;                      \
+			v6_skip.position_offset = *(pos_off_out);                           \
+			v6_skip.flags		   = skip_.flags;                               \
+			v6_entries[skip_entries_count++] = v6_skip;                         \
+		}                                                                       \
+		else                                                                    \
+		{                                                                       \
+			if (skip_entries_count >= skip_entries_capacity)                    \
+			{                                                                   \
+				skip_entries_capacity *= 2;                                     \
+				all_skip_entries = repalloc_huge(                               \
+						all_skip_entries,                                       \
+						skip_entries_capacity * sizeof(TpSkipEntry));           \
+			}                                                                   \
+			all_skip_entries[skip_entries_count++] = skip_;                     \
+		}                                                                       \
 		(num_blocks)++;                                                         \
 	} while (0)
 
@@ -1169,9 +1437,23 @@ write_merged_segment_to_sink(
 		uint32				  doc_count	  = 0;
 		uint32				  num_blocks  = 0;
 
+		/* V6: per-block position tracking arrays */
+		uint16 *position_arrays[TP_BLOCK_SIZE];
+		uint32  position_counts[TP_BLOCK_SIZE];
+		uint64  block_pos_off = 0;
+
 		/* Record where this term's postings start */
 		term_blocks[i].posting_offset	= sink->current_offset;
 		term_blocks[i].skip_entry_start = skip_entries_count;
+
+		/* V6: allocate per-block position offsets */
+		if (is_v6_output)
+		{
+			uint32 max_blocks = (terms[i].num_segment_refs > 0)
+					? (terms[i].num_segment_refs * 1024) : 1;
+			term_blocks[i].position_offsets =
+					palloc0(max_blocks * sizeof(uint64));
+		}
 
 		if (terms[i].num_segment_refs == 0)
 		{
@@ -1183,43 +1465,59 @@ write_merged_segment_to_sink(
 		if (disjoint_sources)
 		{
 			/*
-			 * Fast path: sequential drain. Sources have disjoint
-			 * CTID ranges, so drain source 0, then 1, etc.
-			 * Reads doc_id/frequency/fieldnorm directly from
-			 * the block posting array, skipping CTID lookups.
+			 * Fast path: sequential drain with position support.
+			 * Use posting_source_init (not _fast) so that
+			 * convert_current is called and positions are extracted.
 			 */
-			psources = init_term_posting_sources_fast(
+			psources = init_term_posting_sources(
 					&terms[i], sources, &num_psources);
 
 			for (int src = 0; src < num_psources; src++)
 			{
 				while (!psources[src].exhausted)
 				{
-					TpBlockPosting *bp =
-							&psources[src].block_postings
-									 [psources[src].current_in_block];
+					TpMergePostingInfo *pi =
+							&psources[src].current;
 					int	   seg_idx = terms[i].segment_refs[src].segment_idx;
 					uint32 new_id =
-							doc_mapping.old_to_new[seg_idx][bp->doc_id];
+							doc_mapping.old_to_new[seg_idx][pi->old_doc_id];
 
 					if (new_id == TP_MERGE_DOC_DEAD)
 					{
-						posting_source_advance_fast(&psources[src]);
+						posting_source_advance(&psources[src]);
 						continue;
 					}
 
 					block_buf[block_count].doc_id	 = new_id;
-					block_buf[block_count].frequency = bp->frequency;
-					block_buf[block_count].fieldnorm = bp->fieldnorm;
+					block_buf[block_count].frequency = pi->frequency;
+					block_buf[block_count].fieldnorm = pi->fieldnorm;
 					block_buf[block_count].reserved	 = 0;
+
+					/* V6: capture positions */
+					if (is_v6_output)
+					{
+						position_arrays[block_count] = pi->positions;
+						position_counts[block_count] =
+								pi->position_count;
+					}
 					block_count++;
 					doc_count++;
 
-					posting_source_advance_fast(&psources[src]);
+					posting_source_advance(&psources[src]);
 
 					if (block_count == TP_BLOCK_SIZE)
 					{
-						FLUSH_BLOCK(block_buf, block_count, num_blocks);
+						uint64 pos_off = 0;
+						uint16 *pos_arrays_ptr = is_v6_output
+								? position_arrays : NULL;
+						uint32 *pos_counts_ptr = is_v6_output
+								? position_counts : NULL;
+
+						FLUSH_BLOCK(block_buf, block_count, num_blocks,
+								pos_arrays_ptr, pos_counts_ptr, &pos_off);
+						if (is_v6_output)
+							term_blocks[i].position_offsets[
+									num_blocks - 1] = pos_off;
 						block_count = 0;
 					}
 				}
@@ -1240,10 +1538,12 @@ write_merged_segment_to_sink(
 					break;
 
 				{
-					int src_idx = terms[i].segment_refs[min_idx].segment_idx;
-					uint32 old_doc_id = psources[min_idx].current.old_doc_id;
+					TpMergePostingInfo *pi =
+							&psources[min_idx].current;
+					int src_idx =
+							terms[i].segment_refs[min_idx].segment_idx;
 					uint32 new_id =
-							doc_mapping.old_to_new[src_idx][old_doc_id];
+							doc_mapping.old_to_new[src_idx][pi->old_doc_id];
 
 					if (new_id == TP_MERGE_DOC_DEAD)
 					{
@@ -1252,11 +1552,17 @@ write_merged_segment_to_sink(
 					}
 
 					block_buf[block_count].doc_id = new_id;
-					block_buf[block_count].frequency =
-							psources[min_idx].current.frequency;
-					block_buf[block_count].fieldnorm =
-							psources[min_idx].current.fieldnorm;
+					block_buf[block_count].frequency = pi->frequency;
+					block_buf[block_count].fieldnorm = pi->fieldnorm;
 					block_buf[block_count].reserved = 0;
+
+					/* V6: capture positions */
+					if (is_v6_output)
+					{
+						position_arrays[block_count] = pi->positions;
+						position_counts[block_count] =
+								pi->position_count;
+					}
 				}
 				block_count++;
 				doc_count++;
@@ -1265,7 +1571,17 @@ write_merged_segment_to_sink(
 
 				if (block_count == TP_BLOCK_SIZE)
 				{
-					FLUSH_BLOCK(block_buf, block_count, num_blocks);
+					uint64 pos_off = 0;
+					uint16 *pos_arrays_ptr = is_v6_output
+							? position_arrays : NULL;
+					uint32 *pos_counts_ptr = is_v6_output
+							? position_counts : NULL;
+
+					FLUSH_BLOCK(block_buf, block_count, num_blocks,
+							pos_arrays_ptr, pos_counts_ptr, &pos_off);
+					if (is_v6_output)
+						term_blocks[i].position_offsets[
+								num_blocks - 1] = pos_off;
 					block_count = 0;
 				}
 			}
@@ -1273,7 +1589,19 @@ write_merged_segment_to_sink(
 
 		/* Write final partial block if any */
 		if (block_count > 0)
-			FLUSH_BLOCK(block_buf, block_count, num_blocks);
+		{
+			uint64 pos_off = 0;
+			uint16 *pos_arrays_ptr = is_v6_output
+					? position_arrays : NULL;
+			uint32 *pos_counts_ptr = is_v6_output
+					? position_counts : NULL;
+
+			FLUSH_BLOCK(block_buf, block_count, num_blocks,
+					pos_arrays_ptr, pos_counts_ptr, &pos_off);
+			if (is_v6_output)
+				term_blocks[i].position_offsets[
+						num_blocks - 1] = pos_off;
+		}
 
 		term_blocks[i].doc_freq	   = doc_count;
 		term_blocks[i].block_count = num_blocks;
@@ -1293,10 +1621,12 @@ write_merged_segment_to_sink(
 	/* Write all accumulated skip entries */
 	if (skip_entries_count > 0)
 	{
+		size_t entry_sz = is_v6_output
+				? sizeof(TpSkipEntryV6) : sizeof(TpSkipEntry);
 		merge_sink_write(
 				sink,
 				all_skip_entries,
-				skip_entries_count * sizeof(TpSkipEntry));
+				skip_entries_count * entry_sz);
 	}
 
 	pfree(all_skip_entries);
@@ -1361,6 +1691,8 @@ write_merged_segment_to_sink(
 	/* Backpatch dict entries */
 	{
 		TpDictEntry *dict_entries;
+		size_t		 skip_entry_sz = is_v6_output
+				? sizeof(TpSkipEntryV6) : sizeof(TpSkipEntry);
 
 		dict_entries = palloc(num_terms * sizeof(TpDictEntry));
 		for (i = 0; i < num_terms; i++)
@@ -1368,7 +1700,7 @@ write_merged_segment_to_sink(
 			dict_entries[i].skip_index_offset =
 					header.skip_index_offset +
 					((uint64)term_blocks[i].skip_entry_start *
-					 sizeof(TpSkipEntry));
+					 skip_entry_sz);
 			dict_entries[i].block_count = term_blocks[i].block_count;
 			dict_entries[i].doc_freq	= term_blocks[i].doc_freq;
 		}
@@ -1382,13 +1714,43 @@ write_merged_segment_to_sink(
 	}
 
 	/* Backpatch header */
-	merge_sink_write_at(sink, 0, &header, sizeof(TpSegmentHeader));
+	if (is_v6_output)
+	{
+		TpSegmentHeaderV6 v6_hdr;
+		/* Read current header to get V6 fields */
+		merge_sink_write_at(sink, 0, &header, sizeof(TpSegmentHeader));
+		/* Backpatch V6-specific fields: positions_offset */
+		{
+			uint64 positions_off = header.skip_index_offset
+					+ skip_entries_count * sizeof(TpSkipEntryV6);
+			/* V6 positions_offset is at offset
+			 * offsetof(TpSegmentHeaderV6, positions_offset) */
+			merge_sink_write_at(
+					sink,
+					offsetof(TpSegmentHeaderV6, positions_offset),
+					&positions_off,
+					sizeof(uint64));
+		}
+	}
+	else
+	{
+		merge_sink_write_at(sink, 0, &header, sizeof(TpSegmentHeader));
+	}
 
 	/* Finish writer */
 	tp_segment_writer_finish(&sink->writer);
 
 	/* Cleanup */
 	pfree(string_offsets);
+	/* Free per-term position_offsets if V6 */
+	if (is_v6_output)
+	{
+		for (i = 0; i < num_terms; i++)
+		{
+			if (term_blocks[i].position_offsets)
+				pfree(term_blocks[i].position_offsets);
+		}
+	}
 	pfree(term_blocks);
 	free_merge_doc_mapping(&doc_mapping);
 	tp_docmap_destroy(docmap);
