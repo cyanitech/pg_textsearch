@@ -117,6 +117,7 @@ typedef struct
 {
 	const char *lexeme;
 	int32		frequency;
+	int		original_index;
 } LexemeFreqPair;
 
 static int
@@ -131,6 +132,47 @@ strcmp_wrapper(const void *a, const void *b)
 #ifndef min
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #endif
+
+static bool
+tpvector_version_has_positions(uint8 version)
+{
+	return version >= 3;
+}
+
+static const uint8 *
+tpvector_entries_end(TpVector *v)
+{
+	const uint8 *cursor = (const uint8 *)TPVECTOR_ENTRIES_PTR(v);
+	const uint8 *end = (const uint8 *)v + VARSIZE(v);
+
+	for (int i = 0; i < v->entry_count; i++)
+	{
+		uint32 lex_len;
+
+		(void)tpvector_varint_decode(&cursor, end);
+		lex_len = tpvector_varint_decode(&cursor, end);
+		cursor += lex_len;
+	}
+
+	return cursor;
+}
+
+static void
+tpvector_skip_positions_stream(
+		const uint8 **cursor_ptr, const uint8 *end, int entry_count)
+{
+	const uint8 *cursor = *cursor_ptr;
+
+	for (int i = 0; i < entry_count; i++)
+	{
+		uint32 position_count = tpvector_varint_decode(&cursor, end);
+
+		for (uint32 j = 0; j < position_count; j++)
+			(void)tpvector_varint_decode(&cursor, end);
+	}
+
+	*cursor_ptr = cursor;
+}
 
 PG_FUNCTION_INFO_V1(tpvector_in);
 PG_FUNCTION_INFO_V1(tpvector_out);
@@ -181,7 +223,7 @@ tpvector_validate_v2(TpVector *v)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("v2 bm25vector too small: %u", VARSIZE(v))));
 
-	if (v->version != TPVECTOR_VERSION)
+	if (v->version != 2 && v->version != TPVECTOR_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("unsupported bm25vector version: %u", v->version)));
@@ -228,6 +270,14 @@ tpvector_validate_v2(TpVector *v)
 							i)));
 		cursor += lex_len;
 	}
+
+	if (tpvector_version_has_positions(v->version))
+		tpvector_skip_positions_stream(&cursor, end, v->entry_count);
+
+	if (cursor != end)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("bm25vector payload has trailing garbage")));
 }
 
 TpVector *
@@ -651,37 +701,49 @@ tpvector_eq(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 	}
 
+	if (tpvector_has_positions(vec1) != tpvector_has_positions(vec2))
+	{
+		pfree(index_name1);
+		pfree(index_name2);
+		PG_RETURN_BOOL(false);
+	}
+
 	{
 		TpVectorEntry *e1 = get_tpvector_first_entry(vec1);
+		TpVectorEntry *e2 = get_tpvector_first_entry(vec2);
 
-		for (i = 0; i < vec1->entry_count && result && e1; i++)
+		for (i = 0; i < vec1->entry_count && result && e1 && e2; i++)
 		{
 			TpVectorEntryView v1;
-			TpVectorEntry	 *e2		  = get_tpvector_first_entry(vec2);
-			bool			  found_match = false;
-			int				  j;
+			TpVectorEntryView v2;
 
 			tpvector_entry_decode(e1, &v1);
-
-			for (j = 0; j < vec2->entry_count && e2; j++)
-			{
-				TpVectorEntryView v2;
-
-				tpvector_entry_decode(e2, &v2);
-				if (v1.lexeme_len == v2.lexeme_len &&
-					v1.frequency == v2.frequency &&
-					memcmp(v1.lexeme, v2.lexeme, v1.lexeme_len) == 0)
-				{
-					found_match = true;
-					break;
-				}
-				e2 = get_tpvector_next_entry(e2);
-			}
-
-			if (!found_match)
+			tpvector_entry_decode(e2, &v2);
+			if (v1.lexeme_len != v2.lexeme_len ||
+				v1.frequency != v2.frequency ||
+				memcmp(v1.lexeme, v2.lexeme, v1.lexeme_len) != 0)
 				result = false;
 
+			if (result && tpvector_has_positions(vec1))
+			{
+				uint16 *p1;
+				uint16 *p2;
+				uint32 c1;
+				uint32 c2;
+
+				tpvector_get_entry_positions(vec1, i, &p1, &c1);
+				tpvector_get_entry_positions(vec2, i, &p2, &c2);
+				if (c1 != c2 ||
+					(c1 > 0 && memcmp(p1, p2, c1 * sizeof(uint16)) != 0))
+					result = false;
+				if (p1 != NULL)
+					pfree(p1);
+				if (p2 != NULL)
+					pfree(p2);
+			}
+
 			e1 = get_tpvector_next_entry(e1);
+			e2 = get_tpvector_next_entry(e2);
 		}
 	}
 
@@ -741,6 +803,20 @@ create_tpvector_from_strings(
 		int			 entry_count,
 		const char **lexemes,
 		const int32 *frequencies)
+
+{
+	return create_tpvector_with_positions(
+			index_name, entry_count, lexemes, frequencies, NULL, NULL);
+}
+
+TpVector *
+create_tpvector_with_positions(
+		const char	*index_name,
+		int			 entry_count,
+		const char **lexemes,
+		const int32 *frequencies,
+		uint16	   **positions,
+		const uint32 *position_counts)
 {
 	int				index_name_len;
 	int				total_size;
@@ -766,6 +842,7 @@ create_tpvector_from_strings(
 		{
 			pairs[i].lexeme	   = lexemes[i];
 			pairs[i].frequency = frequencies[i];
+			pairs[i].original_index = i;
 		}
 		if (entry_count > 1)
 			qsort(pairs, entry_count, sizeof(LexemeFreqPair), strcmp_wrapper);
@@ -786,6 +863,24 @@ create_tpvector_from_strings(
 		lex_len = strlen(lex);
 		total_size += tpvector_varint_size((uint32)Max(freq, 0)) +
 					  tpvector_varint_size((uint32)lex_len) + lex_len;
+
+		if (position_counts != NULL)
+		{
+			uint32 count = position_counts[pairs ? pairs[i].original_index : i];
+			uint32 prev = 0;
+
+			total_size += tpvector_varint_size(count);
+			for (uint32 j = 0; j < count; j++)
+			{
+				uint32 current = (uint32)positions[pairs ? pairs[i].original_index : i][j];
+				total_size += tpvector_varint_size(current - prev);
+				prev = current;
+			}
+		}
+		else
+		{
+			total_size += tpvector_varint_size(0);
+		}
 	}
 
 	result = (TpVector *)palloc0(total_size);
@@ -806,6 +901,7 @@ create_tpvector_from_strings(
 	if (pairs)
 	{
 		uint8 *entry_ptr = (uint8 *)TPVECTOR_ENTRIES_PTR(result);
+		uint8 *positions_ptr;
 
 		for (i = 0; i < entry_count; i++)
 		{
@@ -818,7 +914,82 @@ create_tpvector_from_strings(
 			entry_ptr += lex_len;
 		}
 
+		positions_ptr = entry_ptr;
+		for (i = 0; i < entry_count; i++)
+		{
+			int source_index = pairs[i].original_index;
+			uint32 count = position_counts ? position_counts[i] : 0;
+			uint32 prev = 0;
+
+			if (position_counts != NULL)
+				count = position_counts[source_index];
+
+			positions_ptr += tpvector_varint_encode(count, positions_ptr);
+			for (uint32 j = 0; j < count; j++)
+			{
+				uint32 delta = (uint32)positions[source_index][j] - prev;
+				positions_ptr += tpvector_varint_encode(delta, positions_ptr);
+				prev = (uint32)positions[source_index][j];
+			}
+		}
+
 		pfree(pairs);
+	}
+
+	return result;
+}
+
+bool
+tpvector_has_positions(TpVector *vec)
+{
+	vec = tpvector_canonicalize(vec);
+	return tpvector_version_has_positions(vec->version);
+}
+
+void
+tpvector_get_entry_positions(
+		TpVector *vec,
+		int		 entry_index,
+		uint16 **positions_out,
+		uint32  *position_count_out)
+{
+	const uint8 *cursor;
+	const uint8 *end;
+
+	vec = tpvector_canonicalize(vec);
+	*positions_out = NULL;
+	*position_count_out = 0;
+
+	if (!tpvector_version_has_positions(vec->version) || entry_index < 0 ||
+		entry_index >= vec->entry_count)
+		return;
+
+	cursor = tpvector_entries_end(vec);
+	end = (const uint8 *)vec + VARSIZE(vec);
+
+	for (int i = 0; i < vec->entry_count; i++)
+	{
+		uint32 count = tpvector_varint_decode(&cursor, end);
+
+		if (i == entry_index)
+		{
+			uint16 *decoded = NULL;
+			uint32 prev = 0;
+
+			if (count > 0)
+				decoded = palloc(count * sizeof(uint16));
+			for (uint32 j = 0; j < count; j++)
+			{
+				prev += tpvector_varint_decode(&cursor, end);
+				decoded[j] = (uint16)prev;
+			}
+			*positions_out = decoded;
+			*position_count_out = count;
+			return;
+		}
+
+		for (uint32 j = 0; j < count; j++)
+			(void)tpvector_varint_decode(&cursor, end);
 	}
 
 	return result;
@@ -872,11 +1043,39 @@ to_tpvector(PG_FUNCTION_ARGS)
 	pfree(metap);
 	index_close(index_rel, AccessShareLock);
 
-	(void)tp_tokenize_text(
-			input_text, text_config_oid, &lexemes, &frequencies, &entry_count);
+	{
+		uint16 **positions;
+		uint32  *position_counts;
 
-	result = create_tpvector_from_strings(
-			index_name, entry_count, (const char **)lexemes, frequencies);
+		(void)tp_tokenize_text_with_positions(
+				input_text,
+				text_config_oid,
+				&lexemes,
+				&frequencies,
+				&positions,
+				&position_counts,
+				&entry_count);
+
+		result = create_tpvector_with_positions(
+				index_name,
+				entry_count,
+				(const char **)lexemes,
+				frequencies,
+				positions,
+				position_counts);
+
+		if (positions)
+		{
+			for (i = 0; i < entry_count; i++)
+			{
+				if (positions[i] != NULL)
+					pfree(positions[i]);
+			}
+			pfree(positions);
+		}
+		if (position_counts)
+			pfree(position_counts);
+	}
 
 	if (lexemes)
 	{

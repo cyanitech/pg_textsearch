@@ -80,6 +80,14 @@ typedef struct QueryScoreCache
 	TermIdfEntry terms[MAX_CACHED_TERMS];
 } QueryScoreCache;
 
+typedef struct TpPhraseOccurrence
+{
+	uint16 position;
+	char  *term;
+} TpPhraseOccurrence;
+
+static Relation validate_and_open_index(TpQuery *query, Oid *index_oid_out);
+
 /* Local helper functions */
 
 /*
@@ -157,6 +165,514 @@ cache_is_valid(
 	return true;
 }
 
+static void
+free_term_string_array(char **terms, int term_count)
+{
+	int i;
+
+	if (terms == NULL)
+		return;
+
+	for (i = 0; i < term_count; i++)
+	{
+		if (terms[i] != NULL)
+			pfree(terms[i]);
+	}
+
+	pfree(terms);
+}
+
+static int
+phrase_occurrence_cmp(const void *a, const void *b)
+{
+	const TpPhraseOccurrence *left  = (const TpPhraseOccurrence *)a;
+	const TpPhraseOccurrence *right = (const TpPhraseOccurrence *)b;
+
+	if (left->position < right->position)
+		return -1;
+	if (left->position > right->position)
+		return 1;
+	return strcmp(left->term, right->term);
+}
+
+static TpPhraseNode
+build_phrase_node_from_tsvector(TSVector tsvector, const char *query_text)
+{
+	TpPhraseNode	 node;
+	WordEntry		*entries;
+	char			*lexemes_start;
+	TpPhraseOccurrence *occurrences;
+	int			 occurrence_count = 0;
+	int			 i;
+
+	memset(&node, 0, sizeof(node));
+
+	if (tsvector->size == 0)
+		return node;
+
+	entries		 = ARRPTR(tsvector);
+	lexemes_start = STRPTR(tsvector);
+
+	for (i = 0; i < tsvector->size; i++)
+	{
+		if (entries[i].haspos)
+			occurrence_count += POSDATALEN(tsvector, &entries[i]);
+		else
+			occurrence_count += 1;
+	}
+
+	occurrences = palloc0(occurrence_count * sizeof(TpPhraseOccurrence));
+
+	occurrence_count = 0;
+	for (i = 0; i < tsvector->size; i++)
+	{
+		char *lexeme_start = lexemes_start + entries[i].pos;
+		int   lexeme_len   = entries[i].len;
+		int   pos_count;
+		int   j;
+
+		if (entries[i].haspos)
+			pos_count = POSDATALEN(tsvector, &entries[i]);
+		else
+			pos_count = 1;
+
+		for (j = 0; j < pos_count; j++)
+		{
+			char *term = palloc(lexeme_len + 1);
+
+			memcpy(term, lexeme_start, lexeme_len);
+			term[lexeme_len] = '\0';
+
+			occurrences[occurrence_count].term = term;
+			if (entries[i].haspos)
+			{
+				WordEntryPos *posdata = POSDATAPTR(tsvector, &entries[i]);
+
+				occurrences[occurrence_count].position =
+						WEP_GETPOS(posdata[j]);
+			}
+			else
+			{
+				occurrences[occurrence_count].position = (uint16)(j + 1);
+			}
+
+			occurrence_count++;
+		}
+	}
+
+	qsort(
+			occurrences,
+			occurrence_count,
+			sizeof(TpPhraseOccurrence),
+			phrase_occurrence_cmp);
+
+	for (i = 1; i < occurrence_count; i++)
+	{
+		if (occurrences[i - 1].position == occurrences[i].position)
+		{
+			int j;
+
+			for (j = 0; j < occurrence_count; j++)
+				pfree(occurrences[j].term);
+			pfree(occurrences);
+
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("phrase queries do not yet support synonym or "
+							"multi-lexeme expansion"),
+					 errdetail("query text \"%s\" produced multiple lexemes "
+							   "at position %d under the index text configuration",
+							   query_text,
+							   (int)occurrences[i].position),
+					 errhint("Use fuzzy search for now, or choose a text "
+							 "configuration without synonym expansion.")));
+		}
+	}
+
+	node.term_count		 = occurrence_count;
+	node.terms			 = palloc0(occurrence_count * sizeof(char *));
+	node.query_positions = palloc0(occurrence_count * sizeof(int));
+
+	for (i = 0; i < occurrence_count; i++)
+	{
+		node.terms[i]		 = occurrences[i].term;
+		node.query_positions[i] = (int)occurrences[i].position;
+	}
+
+	pfree(occurrences);
+	return node;
+}
+
+TpParsedQuery *
+tp_parse_query_text(const char *query_text, Oid text_config_oid, TpQueryMode mode)
+{
+	TpParsedQuery *parsed;
+	text			 *query_text_datum;
+	Datum			  query_tsvector_datum;
+	TSVector		  query_tsvector;
+
+	parsed			  = palloc0(sizeof(TpParsedQuery));
+	parsed->mode = mode;
+
+	if (query_text == NULL || query_text[0] == '\0')
+		return parsed;
+
+	query_text_datum = cstring_to_text(query_text);
+	query_tsvector_datum = DirectFunctionCall2Coll(
+			to_tsvector_byid,
+			InvalidOid,
+			ObjectIdGetDatum(text_config_oid),
+			PointerGetDatum(query_text_datum));
+	query_tsvector = DatumGetTSVector(query_tsvector_datum);
+
+	(void)tp_extract_terms_from_tsvector(
+			query_tsvector,
+			&parsed->scoring_terms,
+			&parsed->scoring_frequencies,
+			&parsed->scoring_term_count);
+
+	if (mode == TP_QUERY_PHRASE && parsed->scoring_term_count > 0)
+	{
+		parsed->phrase_count = 1;
+		parsed->phrases = palloc0(sizeof(TpPhraseNode));
+		parsed->phrases[0] = build_phrase_node_from_tsvector(
+				query_tsvector, query_text);
+	}
+
+	pfree(query_tsvector);
+	pfree(query_text_datum);
+
+	return parsed;
+}
+
+void
+tp_free_parsed_query(TpParsedQuery *parsed_query)
+{
+	int i;
+
+	if (parsed_query == NULL)
+		return;
+
+	free_term_string_array(
+			parsed_query->scoring_terms, parsed_query->scoring_term_count);
+	if (parsed_query->scoring_frequencies != NULL)
+		pfree(parsed_query->scoring_frequencies);
+
+	if (parsed_query->phrases != NULL)
+	{
+		for (i = 0; i < parsed_query->phrase_count; i++)
+		{
+			free_term_string_array(
+					parsed_query->phrases[i].terms,
+					parsed_query->phrases[i].term_count);
+			if (parsed_query->phrases[i].query_positions != NULL)
+				pfree(parsed_query->phrases[i].query_positions);
+		}
+		pfree(parsed_query->phrases);
+	}
+
+	pfree(parsed_query);
+}
+
+static bool
+find_tsvector_entry_positions(
+		TSVector tsvector,
+		const char *term,
+		const WordEntryPos **positions_out,
+		int *position_count_out)
+{
+	WordEntry *entries;
+	char	 *lexemes_start;
+	int		low;
+	int		high;
+
+	*positions_out	   = NULL;
+	*position_count_out = 0;
+
+	if (tsvector == NULL || term == NULL)
+		return false;
+
+	entries		 = ARRPTR(tsvector);
+	lexemes_start = STRPTR(tsvector);
+	low			 = 0;
+	high			 = tsvector->size - 1;
+
+	while (low <= high)
+	{
+		int mid = low + (high - low) / 2;
+		int lexeme_len = entries[mid].len;
+		int cmp = strncmp(term, lexemes_start + entries[mid].pos, lexeme_len);
+
+		if (cmp == 0)
+		{
+			size_t term_len = strlen(term);
+
+			if ((int)term_len == lexeme_len)
+			{
+				if (entries[mid].haspos)
+				{
+					*positions_out = POSDATAPTR(tsvector, &entries[mid]);
+					*position_count_out = POSDATALEN(tsvector, &entries[mid]);
+				}
+				return true;
+			}
+
+			cmp = ((int)term_len < lexeme_len) ? -1 : 1;
+		}
+
+		if (cmp < 0)
+			high = mid - 1;
+		else
+			low = mid + 1;
+	}
+
+	return false;
+}
+
+static bool
+word_entry_positions_contains(
+		const WordEntryPos *positions, int position_count, int wanted_pos)
+{
+	int low = 0;
+	int high = position_count - 1;
+
+	while (low <= high)
+	{
+		int mid = low + (high - low) / 2;
+		int pos = WEP_GETPOS(positions[mid]);
+
+		if (pos == wanted_pos)
+			return true;
+		if (pos < wanted_pos)
+			low = mid + 1;
+		else
+			high = mid - 1;
+	}
+
+	return false;
+}
+
+static bool
+tsvector_matches_phrase(TSVector tsvector, const TpPhraseNode *phrase)
+{
+	const WordEntryPos **term_positions;
+	int				 *term_position_counts;
+	int				  anchor_idx;
+
+	if (phrase == NULL || phrase->term_count <= 0)
+		return false;
+
+	term_positions = palloc0(phrase->term_count * sizeof(WordEntryPos *));
+	term_position_counts = palloc0(phrase->term_count * sizeof(int));
+
+	for (anchor_idx = 0; anchor_idx < phrase->term_count; anchor_idx++)
+	{
+		if (!find_tsvector_entry_positions(
+					tsvector,
+					phrase->terms[anchor_idx],
+					&term_positions[anchor_idx],
+					&term_position_counts[anchor_idx]) ||
+			term_position_counts[anchor_idx] <= 0)
+		{
+			pfree(term_positions);
+			pfree(term_position_counts);
+			return false;
+		}
+	}
+
+	for (anchor_idx = 0; anchor_idx < term_position_counts[0]; anchor_idx++)
+	{
+		int anchor_pos = WEP_GETPOS(term_positions[0][anchor_idx]);
+		int base_pos   = phrase->query_positions[0];
+		bool matched   = true;
+
+		for (int term_idx = 1; term_idx < phrase->term_count; term_idx++)
+		{
+			int wanted_pos = anchor_pos +
+						 (phrase->query_positions[term_idx] - base_pos);
+
+			if (!word_entry_positions_contains(
+						term_positions[term_idx],
+						term_position_counts[term_idx],
+						wanted_pos))
+			{
+				matched = false;
+				break;
+			}
+		}
+
+		if (matched)
+		{
+			pfree(term_positions);
+			pfree(term_position_counts);
+			return true;
+		}
+	}
+
+	pfree(term_positions);
+	pfree(term_position_counts);
+	return false;
+}
+
+bool
+tp_phrase_match_document_text(
+		text *document_text, const char *query_text, Oid text_config_oid)
+{
+	TpParsedQuery *parsed_query;
+	Datum			  doc_tsvector_datum;
+	TSVector		  doc_tsvector;
+	bool			  matched;
+
+	if (document_text == NULL || query_text == NULL || query_text[0] == '\0')
+		return false;
+
+	parsed_query = tp_parse_query_text(
+			query_text, text_config_oid, TP_QUERY_PHRASE);
+	if (parsed_query->phrase_count <= 0 || parsed_query->phrases == NULL)
+	{
+		tp_free_parsed_query(parsed_query);
+		return false;
+	}
+
+	doc_tsvector_datum = DirectFunctionCall2Coll(
+			to_tsvector_byid,
+			InvalidOid,
+			ObjectIdGetDatum(text_config_oid),
+			PointerGetDatum(document_text));
+	doc_tsvector = DatumGetTSVector(doc_tsvector_datum);
+
+	matched = tsvector_matches_phrase(doc_tsvector, &parsed_query->phrases[0]);
+
+	pfree(doc_tsvector);
+	tp_free_parsed_query(parsed_query);
+	return matched;
+}
+
+/*
+ * Verify a phrase match using stored TpVector positions instead of
+ * re-tokenizing the document.  This is the source-level codepath that
+ * consumes the position sidecar added to bm25vector.
+ *
+ * The algorithm is the same as tsvector_matches_phrase() but operates
+ * on TpVector entry iterators and tpvector_get_entry_positions()
+ * instead of TSVector POSDATAPTR / POSDATALEN.
+ */
+bool
+tp_verify_phrase_with_tpvector(
+		TpVector	*tpvec,
+		const char	*query_text,
+		Oid			 text_config_oid)
+{
+	TpParsedQuery *parsed_query;
+	TpPhraseNode  *phrase;
+	TpVectorEntry *entry;
+	int			   i;
+	bool		   matched = false;
+	uint16		**term_positions;
+	uint32		 *term_position_counts;
+
+	if (tpvec == NULL || query_text == NULL || query_text[0] == '\0')
+		return false;
+
+	if (!tpvector_has_positions(tpvec))
+		return false;
+
+	parsed_query = tp_parse_query_text(
+			query_text, text_config_oid, TP_QUERY_PHRASE);
+	if (parsed_query->phrase_count <= 0 || parsed_query->phrases == NULL)
+	{
+		tp_free_parsed_query(parsed_query);
+		return false;
+	}
+	phrase = &parsed_query->phrases[0];
+
+	term_positions		  = palloc0(phrase->term_count * sizeof(uint16 *));
+	term_position_counts  = palloc0(phrase->term_count * sizeof(uint32));
+
+	/*
+	 * For each query term, locate its entry in the TpVector and
+	 * extract its stored positions.
+	 */
+	for (i = 0; i < phrase->term_count; i++)
+	{
+		bool found = false;
+
+		entry = get_tpvector_first_entry(tpvec);
+		for (int j = 0; j < tpvec->entry_count; j++)
+		{
+			TpVectorEntryView view;
+
+			entry = tpvector_entry_decode_advance(entry, &view);
+			if ((int)view.lexeme_len == (int)strlen(phrase->terms[i]) &&
+				memcmp(view.lexeme, phrase->terms[i], view.lexeme_len) == 0)
+			{
+				tpvector_get_entry_positions(tpvec, j,
+						&term_positions[i], &term_position_counts[i]);
+				found = true;
+				break;
+			}
+		}
+
+		if (!found || term_position_counts[i] <= 0)
+		{
+			pfree(term_positions);
+			pfree(term_position_counts);
+			tp_free_parsed_query(parsed_query);
+			return false;
+		}
+	}
+
+	/*
+	 * Anchor from the first term.  For each position of the first
+	 * term, compute expected positions for subsequent terms using
+	 * the query-side position gap (NOT hardcoded +1).
+	 */
+	{
+		int base_pos = phrase->query_positions[0];
+
+		for (uint32 anchor_idx = 0;
+			 anchor_idx < term_position_counts[0];
+			 anchor_idx++)
+		{
+			int  anchor_pos = term_positions[0][anchor_idx];
+			bool all_match  = true;
+
+			for (int term_idx = 1; term_idx < phrase->term_count; term_idx++)
+			{
+				int wanted_pos = anchor_pos +
+					(phrase->query_positions[term_idx] - base_pos);
+				bool found_pos = false;
+
+				for (uint32 p = 0; p < term_position_counts[term_idx]; p++)
+				{
+					if (term_positions[term_idx][p] == (uint16)wanted_pos)
+					{
+						found_pos = true;
+						break;
+					}
+				}
+
+				if (!found_pos)
+				{
+					all_match = false;
+					break;
+				}
+			}
+
+			if (all_match)
+			{
+				matched = true;
+				break;
+			}
+		}
+	}
+
+	pfree(term_positions);
+	pfree(term_position_counts);
+	tp_free_parsed_query(parsed_query);
+	return matched;
+}
+
 PG_FUNCTION_INFO_V1(tpquery_in);
 PG_FUNCTION_INFO_V1(tpquery_out);
 PG_FUNCTION_INFO_V1(tpquery_recv);
@@ -167,8 +683,11 @@ PG_FUNCTION_INFO_V1(bm25_text_bm25query_score);
 PG_FUNCTION_INFO_V1(bm25_text_text_score);
 PG_FUNCTION_INFO_V1(bm25_textarray_bm25query_score);
 PG_FUNCTION_INFO_V1(bm25_textarray_text_score);
+PG_FUNCTION_INFO_V1(bm25_phrase_text_bm25query_match);
+PG_FUNCTION_INFO_V1(bm25_phrase_text_text_match);
 PG_FUNCTION_INFO_V1(tpquery_eq);
 PG_FUNCTION_INFO_V1(bm25_get_current_score);
+PG_FUNCTION_INFO_V1(bm25_pcteq_always_true);
 
 /*
  * bm25_get_current_score - stub function for ORDER BY optimization
@@ -182,6 +701,71 @@ Datum
 bm25_get_current_score(PG_FUNCTION_ARGS pg_attribute_unused())
 {
 	PG_RETURN_FLOAT8(tp_get_cached_score());
+}
+
+/*
+ * bm25_pcteq_always_true - always returns true
+ *
+ * Underlying function for the %= operator.  The operator serves as
+ * syntactic sugar: the post_parse_analyze hook rewrites
+ *   WHERE col %= 'query' ORDER BY score
+ * into the native
+ *   ORDER BY col <@> 'query'
+ * so real filtering and scoring are driven by BM25 ordering, not by
+ * this function's return value.
+ */
+Datum
+bm25_pcteq_always_true(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	PG_RETURN_BOOL(true);
+}
+
+Datum
+bm25_phrase_text_bm25query_match(PG_FUNCTION_ARGS)
+{
+	text	*text_arg = PG_GETARG_TEXT_PP(0);
+	TpQuery *query = (TpQuery *)PG_DETOAST_DATUM(PG_GETARG_DATUM(1));
+	char	*query_text = get_tpquery_text(query);
+	Relation index_rel = NULL;
+	TpIndexMetaPage metap = NULL;
+	bool	matched = false;
+
+	index_rel = validate_and_open_index(query, NULL);
+
+	PG_TRY();
+	{
+		metap = tp_get_metapage(index_rel);
+		matched = tp_phrase_match_document_text(
+				text_arg, query_text, metap->text_config_oid);
+		pfree(metap);
+		metap = NULL;
+		index_close(index_rel, AccessShareLock);
+		index_rel = NULL;
+	}
+	PG_CATCH();
+	{
+		if (metap != NULL)
+			pfree(metap);
+		if (index_rel != NULL)
+			index_close(index_rel, AccessShareLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	PG_RETURN_BOOL(matched);
+}
+
+Datum
+bm25_phrase_text_text_match(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("no BM25 index found for text == text expression"),
+			 errdetail("Create a BM25 index on the column or use an explicit "
+					   "to_bm25query() binding."),
+			 errhint("SELECT * FROM t WHERE col == 'phrase' ORDER BY score")));
+
+	PG_RETURN_NULL();
 }
 
 /*
@@ -677,10 +1261,6 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 	int32			  *doc_frequencies = NULL;
 	int				   doc_term_count  = 0;
 	int				   raw_doc_length;
-	Datum			   query_tsvector_datum;
-	TSVector		   query_tsvector;
-	WordEntry		  *query_entries;
-	char			  *query_lexemes_start;
 	TpLocalIndexState *index_state;
 	TpDataSource	  *memtable_src = NULL;
 	float4			   avg_doc_len;
@@ -690,14 +1270,12 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 	int				   q_i;
 	float4			   doc_length;
 	int				   query_term_count;
+	TpParsedQuery	 *parsed_query = NULL;
 	QueryScoreCache	  *cache;
 	BlockNumber		   first_segment;
 	BlockNumber		   level_heads[TP_MAX_LEVELS];
 	bool			   is_partitioned;
 	char			  *indexed_colname = NULL;
-	bool			   acquired_lock   = false;
-	bool			   segments_locked = false;
-	TpLocalIndexState *locked_state	   = NULL;
 
 	/* Get index OID from query */
 	index_oid = get_tpquery_index_oid(query);
@@ -862,13 +1440,6 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 		}
 
 		/*
-		 * Issue #404: the lock + level_heads re-read that protect the
-		 * segment reads are taken lazily in the cache-miss branch below.
-		 * total_docs / total_len / first_segment are scalar stats (not
-		 * block numbers), so the unlocked snapshot above is fine here.
-		 */
-
-		/*
 		 * Phase 4 of issue #374: add the active memtable's contribution
 		 * on top of the persisted-segment totals from the metapage.  In
 		 * the partitioned branch above we haven't opened a chain source
@@ -922,16 +1493,8 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 				&doc_frequencies,
 				&doc_term_count);
 
-		/* Tokenize the query text to get query terms (always small) */
-		query_tsvector_datum = DirectFunctionCall2Coll(
-				to_tsvector_byid,
-				InvalidOid,
-				ObjectIdGetDatum(text_config_oid),
-				PointerGetDatum(cstring_to_text(query_text)));
-
-		query_tsvector		= DatumGetTSVector(query_tsvector_datum);
-		query_entries		= ARRPTR(query_tsvector);
-		query_lexemes_start = STRPTR(query_tsvector);
+		parsed_query = tp_parse_query_text(
+				query_text, text_config_oid, TP_QUERY_FUZZY);
 
 		/*
 		 * Calculate document length with fieldnorm quantization.
@@ -941,40 +1504,23 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 		 */
 		doc_length = (float4)decode_fieldnorm(
 				encode_fieldnorm(raw_doc_length));
-		query_term_count = query_tsvector->size;
+		query_term_count = parsed_query->scoring_term_count;
 
 		/* Calculate BM25 score for each query term */
 		for (q_i = 0; q_i < query_term_count; q_i++)
 		{
-			char *query_lexeme_raw = query_lexemes_start +
-									 query_entries[q_i].pos;
-			int	   lexeme_len = query_entries[q_i].len;
-			char  *query_lexeme;
+			char  *query_lexeme = parsed_query->scoring_terms[q_i];
 			float4 idf;
 			float4 tf; /* term frequency in document */
 			float4 term_score;
-			int	   query_freq;
-
-			/* Create properly null-terminated string from tsvector lexeme */
-			query_lexeme = palloc(lexeme_len + 1);
-			memcpy(query_lexeme, query_lexeme_raw, lexeme_len);
-			query_lexeme[lexeme_len] = '\0';
-
-			if (query_entries[q_i].haspos)
-				query_freq = (int32)
-						POSDATALEN(query_tsvector, &query_entries[q_i]);
-			else
-				query_freq = 1;
+			int	   query_freq = parsed_query->scoring_frequencies[q_i];
 
 			/* Find term frequency in the document */
 			tf = find_term_frequency_in_arrays(
 					doc_terms, doc_frequencies, doc_term_count, query_lexeme);
 
 			if (tf == 0.0f)
-			{
-				pfree(query_lexeme);
 				continue; /* Query term not in document */
-			}
 
 			/*
 			 * Get IDF from cache if available. The cache avoids repeated
@@ -1009,37 +1555,6 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 						}
 					}
 
-					/*
-					 * Issue #404: opening segment pages by block number
-					 * races a concurrent spill/merge that frees and
-					 * recycles those blocks ("invalid segment header").
-					 * Hold the per-index lock SHARED and re-read
-					 * level_heads under it, like the index-scan path. Done
-					 * lazily on first cache miss so cache-hit rows pay
-					 * nothing; the chain source may already hold the lock
-					 * (ownership-aware).
-					 */
-					if (!segments_locked)
-					{
-						if (index_state != NULL && !index_state->lock_held)
-						{
-							tp_acquire_index_lock(index_state, LW_SHARED);
-							acquired_lock = true;
-							locked_state  = index_state;
-						}
-						Assert(index_state == NULL || index_state->lock_held);
-
-						if (index_state != NULL)
-						{
-							TpIndexMetaPage fresh = tp_get_metapage(index_rel);
-
-							for (int i = 0; i < TP_MAX_LEVELS; i++)
-								level_heads[i] = fresh->level_heads[i];
-							pfree(fresh);
-						}
-						segments_locked = true;
-					}
-
 					/* Get doc_freq from all segment levels */
 					for (int level = 0; level < TP_MAX_LEVELS; level++)
 					{
@@ -1054,10 +1569,7 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 
 					unified_doc_freq = memtable_doc_freq + segment_doc_freq;
 					if (unified_doc_freq == 0)
-					{
-						pfree(query_lexeme);
 						continue;
-					}
 
 					/* Calculate IDF and cache it */
 					idf = tp_calculate_idf(unified_doc_freq, total_docs);
@@ -1077,22 +1589,15 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 
 			/* Accumulate the score */
 			result += term_score;
-
-			/* Free the null-terminated string copy */
-			pfree(query_lexeme);
 		}
 
 		/* Clean up */
+		tp_free_parsed_query(parsed_query);
+		parsed_query = NULL;
 		if (memtable_src)
 		{
 			tp_source_close(memtable_src);
 			memtable_src = NULL;
-		}
-		/* Release the per-index lock only if we acquired it (issue #404). */
-		if (acquired_lock)
-		{
-			tp_release_index_lock(locked_state);
-			acquired_lock = false;
 		}
 		pfree(metap);
 		metap = NULL;
@@ -1101,10 +1606,10 @@ bm25_text_bm25query_score(PG_FUNCTION_ARGS)
 	}
 	PG_CATCH();
 	{
+		if (parsed_query)
+			tp_free_parsed_query(parsed_query);
 		if (memtable_src)
 			tp_source_close(memtable_src);
-		if (acquired_lock)
-			tp_release_index_lock(locked_state);
 		if (metap)
 			pfree(metap);
 		if (index_rel)
@@ -1134,6 +1639,9 @@ tpquery_eq(PG_FUNCTION_ARGS)
 	if (a->query_text_len != b->query_text_len)
 		PG_RETURN_BOOL(false);
 
+	if (tpquery_is_phrase(a) != tpquery_is_phrase(b))
+		PG_RETURN_BOOL(false);
+
 	/* Compare query texts */
 	{
 		char *query_text_a = get_tpquery_text(a);
@@ -1153,6 +1661,17 @@ TpQuery *
 create_tpquery_explicit(
 		const char *query_text, Oid index_oid, bool explicit_index)
 {
+	return create_tpquery_with_mode(
+			query_text, index_oid, explicit_index, TP_QUERY_FUZZY);
+}
+
+TpQuery *
+create_tpquery_with_mode(
+		const char *query_text,
+		Oid			index_oid,
+		bool		explicit_index,
+		TpQueryMode	mode)
+{
 	TpQuery *result;
 	int		 query_text_len = strlen(query_text);
 	int		 total_size;
@@ -1164,6 +1683,8 @@ create_tpquery_explicit(
 	SET_VARSIZE(result, total_size);
 	result->version		   = TPQUERY_VERSION;
 	result->flags		   = explicit_index ? TPQUERY_FLAG_EXPLICIT_INDEX : 0;
+	if (mode == TP_QUERY_PHRASE)
+		result->flags |= TPQUERY_FLAG_PHRASE;
 	result->index_oid	   = index_oid;
 	result->query_text_len = query_text_len;
 
@@ -1252,6 +1773,14 @@ tpquery_is_explicit_index(TpQuery *tpquery)
 	if (tpquery->version < 2)
 		return false;
 	return (tpquery->flags & TPQUERY_FLAG_EXPLICIT_INDEX) != 0;
+}
+
+bool
+tpquery_is_phrase(TpQuery *tpquery)
+{
+	if (tpquery == NULL || tpquery->version < 2)
+		return false;
+	return (tpquery->flags & TPQUERY_FLAG_PHRASE) != 0;
 }
 
 /*

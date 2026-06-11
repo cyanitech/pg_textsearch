@@ -51,7 +51,7 @@
 #define TPVECTOR_V2_MAGIC1 'M'
 #define TPVECTOR_V2_MAGIC2 '2'
 #define TPVECTOR_V2_MAGIC3 '5'
-#define TPVECTOR_VERSION   2
+#define TPVECTOR_VERSION   3
 
 /*
  * Opaque entry handle. v2 entries are variable-length byte
@@ -103,6 +103,13 @@ TpVector *create_tpvector_from_strings(
 		int			 entry_count,
 		const char **lexemes,
 		const int32 *frequencies);
+TpVector *create_tpvector_with_positions(
+		const char	*index_name,
+		int			 entry_count,
+		const char **lexemes,
+		const int32 *frequencies,
+		uint16	   **positions,
+		const uint32 *position_counts);
 
 char *get_tpvector_index_name(TpVector *tpvec);
 
@@ -165,3 +172,9 @@ void tpvector_validate_v2_buffer(const char *bytes, uint32 len);
 uint32 tpvector_varint_decode(const uint8 **cursor, const uint8 *end);
 size_t tpvector_varint_encode(uint32 v, uint8 *out);
 size_t tpvector_varint_size(uint32 v);
+bool   tpvector_has_positions(TpVector *vec);
+void   tpvector_get_entry_positions(
+		TpVector *vec,
+		int		 entry_index,
+		uint16 **positions_out,
+		uint32  *position_count_out);

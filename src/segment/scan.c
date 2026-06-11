@@ -44,6 +44,21 @@ tp_segment_read_skip_entry(
 		skip->flags			 = v3.flags;
 		memcpy(skip->reserved, v3.reserved, sizeof(v3.reserved));
 	}
+	else if (reader->segment_version >= TP_SEGMENT_FORMAT_VERSION_6)
+	{
+		TpSkipEntryV6 v6;
+
+		skip_offset = skip_index_offset +
+					  (uint64)block_idx * sizeof(TpSkipEntryV6);
+		tp_segment_read(reader, skip_offset, &v6, sizeof(TpSkipEntryV6));
+		skip->last_doc_id	   = v6.last_doc_id;
+		skip->doc_count		   = v6.doc_count;
+		skip->block_max_tf	   = v6.block_max_tf;
+		skip->block_max_norm   = v6.block_max_norm;
+		skip->posting_offset   = v6.posting_offset;
+		skip->flags			   = v6.flags;
+		memcpy(skip->reserved, v6.reserved, sizeof(v6.reserved));
+	}
 	else
 	{
 		skip_offset = skip_index_offset +

@@ -176,6 +176,46 @@ CREATE OPERATOR @extschema@.<@> (
     PROCEDURE = @extschema@.bm25_text_text_score
 );
 
+-- Phrase-match boolean function for text == bm25query.
+CREATE FUNCTION @extschema@.bm25_phrase_text_bm25query_match(
+    left_text text,
+    right_query @extschema@.bm25query)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'bm25_phrase_text_bm25query_match'
+LANGUAGE C IMMUTABLE STRICT PARALLEL UNSAFE COST 1000;
+
+-- Error stub for text == text when planner rewrite cannot bind an index.
+CREATE FUNCTION @extschema@.bm25_phrase_text_text_match(text, text)
+RETURNS boolean
+AS 'MODULE_PATHNAME', 'bm25_phrase_text_text_match'
+LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE COST 1000;
+
+CREATE OPERATOR @extschema@.== (
+    LEFTARG = text,
+    RIGHTARG = @extschema@.bm25query,
+    PROCEDURE = @extschema@.bm25_phrase_text_bm25query_match
+);
+
+CREATE OPERATOR @extschema@.== (
+    LEFTARG = text,
+    RIGHTARG = text,
+    PROCEDURE = @extschema@.bm25_phrase_text_text_match
+);
+
+-- %= operator: syntactic sugar for fuzzy search with auto-ranking.
+-- Usage: SELECT * FROM t WHERE col %= 'query' ORDER BY score LIMIT 10;
+-- The post_parse_analyze hook rewrites this to: ORDER BY col <@> 'query'
+-- The underlying function always returns true; real scoring comes from ORDER BY.
+CREATE FUNCTION @extschema@.bm25_pcteq_always_true(text, text) RETURNS boolean
+    AS 'MODULE_PATHNAME', 'bm25_pcteq_always_true'
+    LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
+CREATE OPERATOR @extschema@.%= (
+    LEFTARG = text,
+    RIGHTARG = text,
+    PROCEDURE = @extschema@.bm25_pcteq_always_true
+);
+
 -- = operator for bm25query equality
 CREATE OPERATOR @extschema@.= (
     LEFTARG = @extschema@.bm25query,

@@ -33,8 +33,10 @@ typedef struct TpScanOpaqueData
 	ItemPointer result_ctids;  /* Array of matching CTIDs */
 	float4	   *result_scores; /* Array of BM25 scores */
 	int			result_count;  /* Number of results */
+	int			raw_result_count; /* Candidate count before phrase filtering */
 	int			current_pos;   /* Current position in results */
 	bool		eof_reached;   /* End of scan flag */
+	bool		phrase_mode;   /* Current scan is for a phrase query */
 
 	/* LIMIT optimization */
 	int limit;			  /* Query LIMIT value, -1 if none */
@@ -122,6 +124,14 @@ int tp_extract_terms_from_tsvector(
 		int32  **frequencies_out,
 		int		*term_count_out);
 
+int tp_extract_terms_and_positions_from_tsvector(
+		TSVector tsvector,
+		char	 ***terms_out,
+		int32	 **frequencies_out,
+		uint16 ***positions_out,
+		uint32  **position_counts_out,
+		int		 *term_count_out);
+
 /*
  * Tokenize a document into terms and frequencies. Handles documents whose
  * lexeme volume would otherwise exceed Postgres's tsvector 1 MB cap by
@@ -135,6 +145,15 @@ int tp_tokenize_text(
 		Oid		text_config_oid,
 		char ***terms_out,
 		int32 **frequencies_out,
+		int	   *term_count_out);
+
+int tp_tokenize_text_with_positions(
+		text	   *document_text,
+		Oid		text_config_oid,
+		char	***terms_out,
+		int32	**frequencies_out,
+		uint16 ***positions_out,
+		uint32 **position_counts_out,
 		int	   *term_count_out);
 
 /* Build progress tracking for partitioned tables */

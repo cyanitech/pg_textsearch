@@ -7,6 +7,7 @@
 #include <postgres.h>
 
 #include <access/genam.h>
+#include <access/heapam.h>
 #include <access/relscan.h>
 #include <access/sdir.h>
 #include <access/table.h>
@@ -25,6 +26,8 @@
 #include "index/metapage.h"
 #include "index/resolve.h"
 #include "index/state.h"
+#include "memtable/chain_walker.h"
+#include "memtable/page.h"
 #include "memtable/scan.h"
 #include "types/query.h"
 #include "types/vector.h"
@@ -126,6 +129,8 @@ tp_rescan_process_orderby(
 					tp_validate_query_index(
 							query_index_oid, scan->indexRelation);
 				}
+
+				so->phrase_mode = tpquery_is_phrase(query);
 			}
 
 			/* Clear query vector since we're using text directly */
@@ -234,8 +239,10 @@ tp_rescan(
 		/* Reset scan position and state */
 		so->current_pos	 = 0;
 		so->result_count = 0;
+		so->raw_result_count = 0;
 		so->eof_reached	 = false;
 		so->query_vector = NULL;
+		so->phrase_mode = false;
 	}
 
 	/* Process ORDER BY scan keys for <@> operator */
@@ -252,6 +259,259 @@ tp_rescan(
 	}
 }
 
+/*
+ * Verify phrase match for a single candidate CTID by first attempting
+ * to read the TpVector (with positions) from the on-disk memtable
+ * chain, then falling back to heap_fetch + re-tokenize.
+ */
+static bool
+tp_verify_single_phrase_ctid(
+		IndexScanDesc scan, ItemPointer ctid,
+		TpVector *tpvec, Oid text_config_oid)
+{
+	if (tpvec != NULL && tpvector_has_positions(tpvec))
+		return tp_verify_phrase_with_tpvector(
+				tpvec,
+				((TpScanOpaque)scan->opaque)->query_text,
+				text_config_oid);
+
+	/* Fallback: heap recheck for CTIDs not in chain */
+	return false; /* caller will try heap path */
+}
+
+/*
+ * Walk the memtable chain and build a CTID→TpVector lookup for
+ * phrase verification.  Only stores records whose CTID matches one
+ * of the candidates, and only when positions are present.
+ *
+ * Returns a hash table (CTID→TpVector) or NULL if the chain is
+ * empty or has no position-bearing records.
+ */
+static HTAB *
+tp_build_ctid_vector_hash(IndexScanDesc scan, int raw_result_count)
+{
+	TpScanOpaque	   so = (TpScanOpaque)scan->opaque;
+	TpChainWalker	  *walker;
+	TpChainWalkerRecord rec;
+	HTAB			  *ctid_ht = NULL;
+	HASHCTL			   ctl;
+	TpIndexMetaPage	   metap;
+	MemoryContext	   oldctx;
+
+	metap = tp_get_metapage(scan->indexRelation);
+	if (metap == NULL || metap->memtable_head_blkno == InvalidBlockNumber)
+	{
+		if (metap) pfree(metap);
+		return NULL;
+	}
+
+	/* Build hash table keyed by raw ItemPointerData */
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize   = sizeof(ItemPointerData);
+	ctl.entrysize = sizeof(ItemPointerData) + sizeof(TpVector *);
+	ctl.hcxt	   = CurrentMemoryContext;
+	ctid_ht = hash_create("bm25 phrase ctid→vector",
+			raw_result_count, &ctl,
+			HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	/* Pre-populate: all candidates flagged as "not yet found" */
+	for (int i = 0; i < raw_result_count; i++)
+	{
+		bool found;
+		TpVector **slot = (TpVector **)hash_search(
+				ctid_ht, &so->result_ctids[i], HASH_ENTER, &found);
+
+		Assert(!found);
+		if (slot)
+			*slot = NULL;
+	}
+
+	/*
+	 * Walk the chain.  For each record whose CTID is in our hash
+	 * table, store a reference to the TpVector bytes.  We only care
+	 * about records that carry positions.
+	 */
+	walker = tp_chain_walker_open(
+			scan->indexRelation,
+			metap->memtable_head_blkno,
+			0,
+			CurrentMemoryContext);
+
+	pfree(metap);
+
+	while (tp_chain_walker_next(walker, &rec))
+	{
+		bool		found;
+		TpVector   **slot;
+		TpVector	*vec;
+
+		slot = (TpVector **)hash_search(
+				ctid_ht, &rec.ctid, HASH_FIND, &found);
+		if (!found || slot == NULL)
+			continue;
+
+		/* Already filled by a duplicate? Skip. */
+		if (*slot != NULL)
+			continue;
+
+		vec = (TpVector *)rec.vector_bytes;
+		if (!tpvector_has_positions(vec))
+			continue;
+
+		/*
+		 * For fragments, the vector is palloc'd and survives the
+		 * walker; for inline records it's in a buffer page and must
+		 * be copied.
+		 */
+		if (rec.is_fragment)
+		{
+			*slot = vec; /* survives walker close */
+		}
+		else
+		{
+			oldctx = MemoryContextSwitchTo(CurrentMemoryContext);
+			*slot = (TpVector *)palloc(rec.vector_len);
+			memcpy(*slot, rec.vector_bytes, rec.vector_len);
+			MemoryContextSwitchTo(oldctx);
+		}
+	}
+
+	tp_chain_walker_close(walker);
+	return ctid_ht;
+}
+
+static bool
+tp_filter_phrase_results(
+		IndexScanDesc scan, Oid text_config_oid, int raw_result_count)
+{
+	TpScanOpaque so = (TpScanOpaque)scan->opaque;
+	Relation	 heap_rel;
+	AttrNumber	 attnum;
+	TupleDesc	 heap_desc;
+	HeapTupleData tuple_data;
+	HeapTuple	 tuple = &tuple_data;
+	Buffer		 heap_buf = InvalidBuffer;
+	ItemPointerData *filtered_ctids;
+	float4		   *filtered_scores;
+	int				 filtered_count = 0;
+	HTAB		   *ctid_vector_ht = NULL;
+
+	if (!so->phrase_mode || raw_result_count <= 0)
+		return raw_result_count > 0;
+
+	if (scan->indexRelation->rd_index == NULL ||
+		scan->indexRelation->rd_index->indnatts < 1 ||
+		scan->indexRelation->rd_index->indkey.values[0] <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("phrase queries are not yet supported on BM25 "
+						"expression indexes")));
+
+	attnum = scan->indexRelation->rd_index->indkey.values[0];
+	heap_rel = table_open(
+			scan->indexRelation->rd_index->indrelid, AccessShareLock);
+	heap_desc = RelationGetDescr(heap_rel);
+
+	if (TupleDescAttr(heap_desc, attnum - 1)->atttypid != TEXTOID)
+	{
+		table_close(heap_rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("phrase queries currently support only text columns")));
+	}
+
+	/*
+	 * Build CTID→TpVector hash from the memtable chain so we can
+	 * verify phrase matches directly from stored positions.
+	 */
+	ctid_vector_ht = tp_build_ctid_vector_hash(scan, raw_result_count);
+
+	filtered_ctids	= palloc(raw_result_count * sizeof(ItemPointerData));
+	filtered_scores = palloc(raw_result_count * sizeof(float4));
+
+	for (int i = 0; i < raw_result_count; i++)
+	{
+		bool	matched	   = false;
+		bool	tried_chain = false;
+
+		/*
+		 * Primary path: check stored positions from the memtable
+		 * chain.  This is the fast, zero-heap-access path.
+		 */
+		if (ctid_vector_ht != NULL)
+		{
+			bool		found;
+			TpVector   **slot;
+
+			slot = (TpVector **)hash_search(
+					ctid_vector_ht, &so->result_ctids[i],
+					HASH_FIND, &found);
+
+			if (found && slot != NULL && *slot != NULL)
+			{
+				tried_chain = true;
+				matched = tp_verify_single_phrase_ctid(
+						scan, &so->result_ctids[i],
+						*slot, text_config_oid);
+			}
+		}
+
+		/*
+		 * Fallback: heap recheck for CTIDs not found in the
+		 * chain (e.g. rows that only exist in segments).
+		 */
+		if (!tried_chain)
+		{
+			Datum document_datum;
+			bool  isnull;
+			bool  valid;
+
+			tuple->t_self = so->result_ctids[i];
+			valid = heap_fetch(heap_rel, SnapshotAny,
+					tuple, &heap_buf, true);
+			if (!valid)
+			{
+				if (heap_buf != InvalidBuffer)
+					ReleaseBuffer(heap_buf);
+				heap_buf = InvalidBuffer;
+				continue;
+			}
+
+			document_datum = heap_getattr(
+					tuple, attnum, heap_desc, &isnull);
+			if (!isnull)
+				matched = tp_phrase_match_document_text(
+						DatumGetTextPP(document_datum),
+						so->query_text,
+						text_config_oid);
+
+			if (heap_buf != InvalidBuffer)
+				ReleaseBuffer(heap_buf);
+			heap_buf = InvalidBuffer;
+		}
+
+		if (matched)
+		{
+			filtered_ctids[filtered_count] = so->result_ctids[i];
+			filtered_scores[filtered_count] = so->result_scores[i];
+			filtered_count++;
+		}
+	}
+
+	table_close(heap_rel, AccessShareLock);
+
+	if (ctid_vector_ht != NULL)
+		hash_destroy(ctid_vector_ht);
+
+	pfree(so->result_ctids);
+	pfree(so->result_scores);
+	so->result_ctids  = filtered_ctids;
+	so->result_scores = filtered_scores;
+	so->result_count  = filtered_count;
+	so->current_pos   = 0;
+
+	return filtered_count > 0;
+}
 /*
  * End a scan and cleanup resources
  */
@@ -320,6 +580,7 @@ tp_execute_scoring_query(IndexScanDesc scan)
 	}
 
 	so->result_count = 0;
+	so->raw_result_count = 0;
 	so->current_pos	 = 0;
 
 	/* Get the index state with posting lists */
@@ -335,9 +596,19 @@ tp_execute_scoring_query(IndexScanDesc scan)
 	}
 
 	/*
-	 * Acquire shared lock BEFORE reading metapage.
+		so->raw_result_count = result_count;
+		so->result_count	 = result_count;
 	 * This ensures the metapage and memtable are read in a
 	 * consistent state — spill (which rewrites both) requires
+
+		if (result_count > 0 && so->phrase_mode)
+		{
+			(void)tp_filter_phrase_results(
+					scan, metap->text_config_oid, result_count);
+			success = (so->raw_result_count > 0);
+		}
+		else
+			success = (result_count > 0);
 	 * LW_EXCLUSIVE, which is blocked while we hold shared.
 	 */
 	tp_acquire_index_lock(index_state, LW_SHARED);
@@ -346,7 +617,7 @@ tp_execute_scoring_query(IndexScanDesc scan)
 	metap = tp_get_metapage(scan->indexRelation);
 	if (!metap)
 	{
-		tp_release_index_lock(index_state);
+		return success;
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to get metapage for index %s",
@@ -447,7 +718,7 @@ tp_gettuple(IndexScanDesc scan, ScanDirection dir)
 		 * query, skipping already-returned results.
 		 */
 		if (!so->eof_reached && so->result_count > 0 &&
-			so->result_count >= so->max_results_used &&
+			so->raw_result_count >= so->max_results_used &&
 			so->max_results_used < TP_MAX_QUERY_LIMIT)
 		{
 			int old_count = so->result_count;

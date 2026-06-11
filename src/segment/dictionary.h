@@ -21,6 +21,11 @@ struct TpSegmentHeader;
  * caller's memory context, e.g. the chain source's private mcxt that
  * already holds the parallel ctid/freq arrays).  tp_write_segment
  * reads them directly; it does not free or take ownership.
+ *
+ * positions / position_counts are OPTIONAL (may be NULL for V5
+ * segments).  When non-NULL, tp_write_segment writes V6 format
+ * with position data.  position_counts[j] is the number of
+ * positions for ctids[j]; positions[j] points to that array.
  */
 typedef struct TermInfo
 {
@@ -28,7 +33,9 @@ typedef struct TermInfo
 	uint32			 term_len;		 /* Term length */
 	ItemPointerData *ctids;			 /* Array of doc CTIDs (len = count) */
 	int32			*freqs;			 /* Array of term freqs (len = count) */
-	uint32			 count;			 /* Length of ctids/freqs */
+	uint16		  **positions;		 /* V6: Array of position arrays */
+	uint32		   *position_counts; /* V6: Array of position counts */
+	uint32			 count;			 /* Length of ctids/freqs/positions */
 	uint32			 doc_freq;		 /* Document frequency (used for IDF) */
 	uint32			 dict_entry_idx; /* Index in dict_entries array */
 } TermInfo;

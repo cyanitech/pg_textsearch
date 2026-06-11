@@ -242,6 +242,55 @@ tp_segment_open_ex(Relation index, BlockNumber root_block, bool load_ctids)
 				   sizeof(TpSegmentHeader));
 			header = reader->header;
 		}
+		else if (raw_version == TP_SEGMENT_FORMAT_VERSION_6)
+		{
+			/*
+			 * V6: read V6 header, copy V5-compatible fields to
+			 * the runtime TpSegmentHeader, and track positions_offset
+			 * + capability_flags in a small sidecar.
+			 */
+			TpSegmentHeaderV6 v6;
+
+			memcpy(&v6,
+				   PageGetContents(header_page),
+				   sizeof(TpSegmentHeaderV6));
+
+			header						= reader->header;
+			header->magic				= v6.magic;
+			header->version				= v6.version;
+			header->created_at			= v6.created_at;
+			header->num_pages			= v6.num_pages;
+			header->data_size			= v6.data_size;
+			header->level				= v6.level;
+			header->next_segment		= v6.next_segment;
+			header->dictionary_offset	= v6.dictionary_offset;
+			header->strings_offset		= v6.strings_offset;
+			header->entries_offset		= v6.entries_offset;
+			header->postings_offset		= v6.postings_offset;
+			header->skip_index_offset	= v6.skip_index_offset;
+			header->fieldnorm_offset	= v6.fieldnorm_offset;
+			header->ctid_pages_offset	= v6.ctid_pages_offset;
+			header->ctid_offsets_offset = v6.ctid_offsets_offset;
+			header->alive_bitset_offset = v6.alive_bitset_offset;
+			header->alive_count			= v6.alive_count;
+			header->num_terms			= v6.num_terms;
+			header->num_docs			= v6.num_docs;
+			header->total_tokens		= v6.total_tokens;
+			header->page_index			= v6.page_index;
+
+			/*
+			 * Store V6 extras in a small sidecar appended to the
+			 * reader's header buffer.  The positions_offset field is
+			 * only valid when (capability_flags & HAS_POSITIONS).
+			 * We store both v6 fields for use by the positions reader.
+			 */
+			{
+				uint64 *v6_sidecar = palloc(2 * sizeof(uint64));
+				v6_sidecar[0] = v6.positions_offset;
+				v6_sidecar[1] = v6.capability_flags;
+				reader->v6_data = v6_sidecar;
+			}
+		}
 		else
 		{
 			UnlockReleaseBuffer(header_buf);
@@ -949,7 +998,25 @@ typedef struct TermBlockInfo
 	uint32 block_count;		 /* Number of blocks for this term */
 	uint32 doc_freq;		 /* Document frequency */
 	uint32 skip_entry_start; /* Index into accumulated skip entries array */
+	uint64 *position_offsets; /* V6: per-block position offsets (palloc'd) */
 } TermBlockInfo;
+
+/*
+ * Encode a uint32 as a variable-length integer (little-endian base-128).
+ * Returns the number of bytes written to out[]. Maximum 5 bytes for uint32.
+ */
+static size_t
+tp_write_varint_encode(uint32 v, uint8 *out)
+{
+	size_t n = 0;
+	while (v > 127)
+	{
+		out[n++] = (uint8)(v & 0x7F) | 0x80;
+		v >>= 7;
+	}
+	out[n++] = (uint8)(v & 0x7F);
+	return n;
+}
 
 /*
  * Write segment from a pre-built dictionary + docmap, e.g. produced
@@ -1014,33 +1081,72 @@ tp_write_segment(
 		elog(ERROR, "tp_write_segment: Failed to allocate first page");
 	}
 
-	/* Initialize header */
-	memset(&header, 0, sizeof(TpSegmentHeader));
-	header.magic		= TP_SEGMENT_MAGIC;
-	header.version		= TP_SEGMENT_FORMAT_VERSION;
-	header.created_at	= GetCurrentTimestamp();
-	header.num_pages	= 0;
-	header.num_terms	= num_terms;
-	header.level		= 0;
-	header.next_segment = InvalidBlockNumber;
-
-	/* Dictionary immediately follows header */
-	header.dictionary_offset = sizeof(TpSegmentHeader);
-
 	/*
-	 * Placeholder per-segment counts; header.num_docs and
-	 * header.total_tokens are overwritten below with the docmap's
-	 * per-segment values (Σ raw doc_length) before the final on-disk
-	 * patch.  Build-context writes use the same raw sum; merge uses
-	 * source headers plus a dead-only fieldnorm correction so all
-	 * three paths produce raw-equivalent totals for the common case
-	 * of all-live sources.
+	 * Detect V6: if any term carries positions, write V6 format
+	 * with TP_SEGMENT_FLAG_HAS_POSITIONS in capability_flags.
 	 */
-	header.num_docs		= 0;
-	header.total_tokens = 0;
+	{
+		bool has_positions = false;
+		for (i = 0; i < num_terms; i++)
+		{
+			if (terms[i].positions != NULL && terms[i].position_counts != NULL)
+			{
+				has_positions = true;
+				break;
+			}
+		}
 
-	/* Write placeholder header */
-	tp_segment_writer_write(&writer, &header, sizeof(TpSegmentHeader));
+		/* Initialize header (V5 or V6) */
+		memset(&header, 0, sizeof(TpSegmentHeader));
+		header.magic		= TP_SEGMENT_MAGIC;
+		header.version		= has_positions
+							? TP_SEGMENT_FORMAT_VERSION_6
+							: TP_SEGMENT_FORMAT_VERSION;
+		header.created_at	= GetCurrentTimestamp();
+		header.num_pages	= 0;
+		header.num_terms	= num_terms;
+		header.level		= 0;
+		header.next_segment = InvalidBlockNumber;
+
+		/* Dictionary immediately follows header */
+		header.dictionary_offset = has_positions
+				? sizeof(TpSegmentHeaderV6)
+				: sizeof(TpSegmentHeader);
+
+		/*
+		 * Placeholder per-segment counts; header.num_docs and
+		 * header.total_tokens are overwritten below with the docmap's
+		 * per-segment values before the final on-disk patch.
+		 */
+		header.num_docs		= 0;
+		header.total_tokens = 0;
+
+		/* Write placeholder header */
+		if (has_positions)
+		{
+			TpSegmentHeaderV6 v6_header;
+			memset(&v6_header, 0, sizeof(v6_header));
+			v6_header.magic				   = header.magic;
+			v6_header.version			   = header.version;
+			v6_header.created_at		   = header.created_at;
+			v6_header.num_pages			   = header.num_pages;
+			v6_header.num_terms			   = header.num_terms;
+			v6_header.level				   = header.level;
+			v6_header.next_segment		   = header.next_segment;
+			v6_header.dictionary_offset	   = header.dictionary_offset;
+			v6_header.num_docs			   = header.num_docs;
+			v6_header.total_tokens		   = header.total_tokens;
+			v6_header.capability_flags	   = TP_SEGMENT_FLAG_HAS_POSITIONS;
+			v6_header.positions_offset	   = 0; /* backpatched later */
+			tp_segment_writer_write(
+					&writer, &v6_header, sizeof(TpSegmentHeaderV6));
+		}
+		else
+		{
+			tp_segment_writer_write(
+					&writer, &header, sizeof(TpSegmentHeader));
+		}
+	}
 
 	/* Write dictionary section */
 	dict.num_terms = num_terms;
@@ -1092,7 +1198,9 @@ tp_write_segment(
 
 	skip_entries_capacity = 1024;
 	skip_entries_count	  = 0;
-	all_skip_entries = palloc(skip_entries_capacity * sizeof(TpSkipEntry));
+	all_skip_entries = palloc(skip_entries_capacity *
+			(header.version >= TP_SEGMENT_FORMAT_VERSION_6
+			 ? sizeof(TpSkipEntryV6) : sizeof(TpSkipEntry)));
 
 	/*
 	 * Streaming pass: for each term, convert postings and write immediately.
@@ -1118,6 +1226,11 @@ tp_write_segment(
 		/* Calculate number of blocks (always >= 1 since doc_count > 0 here) */
 		num_blocks = (doc_count + TP_BLOCK_SIZE - 1) / TP_BLOCK_SIZE;
 		term_blocks[i].block_count = num_blocks;
+
+		/* V6: allocate per-block position offsets */
+		if (header.version >= TP_SEGMENT_FORMAT_VERSION_6)
+			term_blocks[i].position_offsets =
+					palloc0(num_blocks * sizeof(uint64));
 
 		/* Convert postings to block format */
 		block_postings = palloc(doc_count * sizeof(TpBlockPosting));
@@ -1231,15 +1344,87 @@ tp_write_segment(
 						(block_end - block_start) * sizeof(TpBlockPosting));
 			}
 
-			/* Accumulate skip entry */
-			if (skip_entries_count >= skip_entries_capacity)
+			/*
+			 * V6: write position data for this block.
+			 * Each doc in the block gets: varint position_count
+			 * followed by varint delta-encoded positions.
+			 * Position data is always stored uncompressed.
+			 */
 			{
-				skip_entries_capacity *= 2;
-				all_skip_entries = repalloc_huge(
-						all_skip_entries,
-						skip_entries_capacity * sizeof(TpSkipEntry));
+				uint64 position_off = writer.current_offset;
+				uint32 j;
+
+				for (j = block_start; j < block_end; j++)
+				{
+					uint32  pc = terms[i].position_counts
+						? terms[i].position_counts[j] : 0;
+					uint16 *pos = terms[i].positions
+						? terms[i].positions[j] : NULL;
+					uint8   varint_buf[16];
+					size_t  vl;
+
+					/* Position count varint */
+					vl = tp_write_varint_encode(pc, varint_buf);
+					tp_segment_writer_write(&writer, varint_buf, vl);
+
+					if (pc > 0 && pos != NULL)
+					{
+						uint16 prev = 0;
+						uint32 p;
+
+						for (p = 0; p < pc; p++)
+						{
+							uint16 delta = pos[p] - prev;
+							prev = pos[p];
+							vl = tp_write_varint_encode(
+									delta, varint_buf);
+							tp_segment_writer_write(
+									&writer, varint_buf, vl);
+						}
+					}
+				}
+
+				/* Record for V6 skip entry */
+				if (header.version >= TP_SEGMENT_FORMAT_VERSION_6
+					&& term_blocks[i].position_offsets)
+					term_blocks[i].position_offsets[block_idx] =
+							position_off;
 			}
-			all_skip_entries[skip_entries_count++] = skip;
+
+			/* Accumulate skip entry */
+			if (header.version >= TP_SEGMENT_FORMAT_VERSION_6)
+			{
+				TpSkipEntryV6 *v6_entries = (TpSkipEntryV6 *)all_skip_entries;
+				TpSkipEntryV6  v6_skip;
+
+				if (skip_entries_count >= skip_entries_capacity)
+				{
+					skip_entries_capacity *= 2;
+					v6_entries = repalloc_huge(v6_entries,
+							skip_entries_capacity * sizeof(TpSkipEntryV6));
+					all_skip_entries = (TpSkipEntry *)v6_entries;
+				}
+				memset(&v6_skip, 0, sizeof(v6_skip));
+				v6_skip.last_doc_id		= skip.last_doc_id;
+				v6_skip.doc_count		= skip.doc_count;
+				v6_skip.block_max_tf	= skip.block_max_tf;
+				v6_skip.block_max_norm	= skip.block_max_norm;
+				v6_skip.posting_offset	= skip.posting_offset;
+				v6_skip.position_offset	=
+						term_blocks[i].position_offsets[block_idx];
+				v6_skip.flags			= skip.flags;
+				v6_entries[skip_entries_count++] = v6_skip;
+			}
+			else
+			{
+				if (skip_entries_count >= skip_entries_capacity)
+				{
+					skip_entries_capacity *= 2;
+					all_skip_entries = repalloc_huge(all_skip_entries,
+							skip_entries_capacity * sizeof(TpSkipEntry));
+				}
+				all_skip_entries[skip_entries_count++] = skip;
+			}
 		}
 
 		pfree(block_postings);
@@ -1251,10 +1436,12 @@ tp_write_segment(
 	/* Write all accumulated skip entries */
 	if (skip_entries_count > 0)
 	{
+		size_t entry_sz = (header.version >= TP_SEGMENT_FORMAT_VERSION_6)
+				? sizeof(TpSkipEntryV6) : sizeof(TpSkipEntry);
 		tp_segment_writer_write(
 				&writer,
 				all_skip_entries,
-				skip_entries_count * sizeof(TpSkipEntry));
+				skip_entries_count * entry_sz);
 	}
 
 	pfree(all_skip_entries);
@@ -1479,6 +1666,16 @@ tp_write_segment(
 		existing_header->num_pages			 = header.num_pages;
 		existing_header->page_index			 = header.page_index;
 
+		/* V6: backpatch positions_offset to point past skip index */
+		if (header.version >= TP_SEGMENT_FORMAT_VERSION_6)
+		{
+			TpSegmentHeaderV6 *v6_hdr =
+					(TpSegmentHeaderV6 *)existing_header;
+			v6_hdr->positions_offset = header.skip_index_offset
+					+ skip_entries_count
+					* sizeof(TpSkipEntryV6);
+		}
+
 		GenericXLogFinish(xlog_state);
 		UnlockReleaseBuffer(header_buf);
 	}
@@ -1487,6 +1684,15 @@ tp_write_segment(
 
 	/* Clean up writer-owned state. Caller frees terms[] and docmap. */
 	pfree(string_offsets);
+	/* Free per-term position_offsets before freeing term_blocks */
+	if (header.version >= TP_SEGMENT_FORMAT_VERSION_6)
+	{
+		for (i = 0; i < num_terms; i++)
+		{
+			if (term_blocks[i].position_offsets)
+				pfree(term_blocks[i].position_offsets);
+		}
+	}
 	pfree(term_blocks);
 	if (writer.pages)
 		pfree(writer.pages);

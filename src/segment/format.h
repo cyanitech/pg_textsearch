@@ -42,6 +42,10 @@ typedef struct TpPageIndexSpecial
 #define TP_SEGMENT_FORMAT_VERSION_3 3 /* Legacy: uint32 offsets */
 #define TP_SEGMENT_FORMAT_VERSION_4 4 /* Legacy: no alive bitset */
 #define TP_SEGMENT_FORMAT_VERSION	5 /* Current: alive bitset */
+#define TP_SEGMENT_FORMAT_VERSION_6 6 /* V6: positions sidecar + capability flags */
+
+/* Segment capability flags (V6+ header field) */
+#define TP_SEGMENT_FLAG_HAS_POSITIONS 0x01 /* stored term positions present */
 
 /*
  * V3 legacy segment header - preserved for reading old segments.
@@ -96,6 +100,42 @@ typedef struct TpSegmentHeaderV4
 	uint64		total_tokens;
 	BlockNumber page_index;
 } TpSegmentHeaderV4;
+
+/*
+ * V6 segment header — extends V5 with capability_flags and
+ * positions_offset.  Backward compatible with V5: a V5 reader
+ * sees V5-sized bytes and ignores the trailing fields.  V6
+ * segments are only written when positions are present.
+ */
+typedef struct TpSegmentHeaderV6
+{
+	uint32		magic;
+	uint32		version;
+	TimestampTz created_at;
+	uint32		num_pages;
+	uint64		data_size;
+	uint32		level;
+	BlockNumber next_segment;
+	uint64		dictionary_offset;
+	uint64		strings_offset;
+	uint64		entries_offset;
+	uint64		postings_offset;
+	uint64		skip_index_offset;
+	uint64		fieldnorm_offset;
+	uint64		ctid_pages_offset;
+	uint64		ctid_offsets_offset;
+	/* V5 fields */
+	uint64		alive_bitset_offset;
+	uint32		alive_count;
+	uint32		num_terms;
+	uint32		num_docs;
+	uint64		total_tokens;
+	BlockNumber page_index;
+	/* V6 fields */
+	uint64		positions_offset;	/* Offset to position data section */
+	uint32		capability_flags;	/* TP_SEGMENT_FLAG_* bitmask */
+	uint32		reserved_v6;		/* Padding / future use */
+} TpSegmentHeaderV6;
 
 /*
  * Segment header - stored on the first page (V5: alive bitset)
@@ -237,6 +277,22 @@ typedef struct TpSkipEntry
 	uint8  flags;		   /* Compression type, etc. */
 	uint8  reserved[3];	   /* Future use */
 } __attribute__((packed)) TpSkipEntry;
+
+/*
+ * V6 skip index entry - 28 bytes per block.
+ * Adds position_offset alongside the existing posting_offset.
+ */
+typedef struct TpSkipEntryV6
+{
+	uint32 last_doc_id;
+	uint8  doc_count;
+	uint16 block_max_tf;
+	uint8  block_max_norm;
+	uint64 posting_offset;
+	uint64 position_offset; /* V6: offset to position data for this block */
+	uint8  flags;
+	uint8  reserved[3];
+} __attribute__((packed)) TpSkipEntryV6;
 
 /* Skip entry flags */
 #define TP_BLOCK_FLAG_UNCOMPRESSED 0x00 /* Raw doc IDs and frequencies */

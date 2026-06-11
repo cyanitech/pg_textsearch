@@ -65,6 +65,8 @@ tp_dict_entry_size(uint32 version)
 static inline size_t
 tp_skip_entry_size(uint32 version)
 {
+	if (version >= TP_SEGMENT_FORMAT_VERSION_6)
+		return sizeof(TpSkipEntryV6);
 	return (version <= TP_SEGMENT_FORMAT_VERSION_3) ? sizeof(TpSkipEntryV3)
 													: sizeof(TpSkipEntry);
 }

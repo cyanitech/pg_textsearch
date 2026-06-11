@@ -49,6 +49,9 @@ typedef struct TpSegmentReader
 	/* BufFile-backed reading (for temp file segments, NULL for normal) */
 	BufFile *buffile;
 	uint64	 buffile_base; /* Base byte offset of segment in BufFile */
+
+	/* V6 sidecar: [positions_offset (uint64), capability_flags (uint64)] */
+	uint64 *v6_data; /* NULL for non-V6 segments */
 } TpSegmentReader;
 
 /*

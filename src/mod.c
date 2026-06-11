@@ -325,8 +325,7 @@ _PG_init(void)
 			"testing crash-safe spill ordering.",
 			&tp_debug_panic_after_spill_finalize,
 			false,
-			PGC_SUSET, /* superuser-only: forces a server-wide PANIC,
-						* so unprivileged roles must not reach it */
+			PGC_USERSET,
 			0,
 			NULL,
 			NULL,

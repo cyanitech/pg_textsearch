@@ -24,6 +24,30 @@
  * Flags for TpQuery
  */
 #define TPQUERY_FLAG_EXPLICIT_INDEX 0x01 /* Index was explicitly specified */
+#define TPQUERY_FLAG_PHRASE		 0x02 /* Query is used for phrase matching */
+
+typedef enum TpQueryMode
+{
+	TP_QUERY_FUZZY,
+	TP_QUERY_PHRASE
+} TpQueryMode;
+
+typedef struct TpPhraseNode
+{
+	int	   term_count;
+	char **terms;
+	int	  *query_positions;
+} TpPhraseNode;
+
+typedef struct TpParsedQuery
+{
+	TpQueryMode mode;
+	int			scoring_term_count;
+	char	  **scoring_terms;
+	int32	   *scoring_frequencies;
+	int			phrase_count;
+	TpPhraseNode *phrases;
+} TpParsedQuery;
 
 /*
  * tpquery data type structure
@@ -61,15 +85,34 @@ Datum bm25_text_bm25query_score(PG_FUNCTION_ARGS);
 Datum bm25_text_text_score(PG_FUNCTION_ARGS);
 Datum bm25_textarray_bm25query_score(PG_FUNCTION_ARGS);
 Datum bm25_textarray_text_score(PG_FUNCTION_ARGS);
+Datum bm25_phrase_text_bm25query_match(PG_FUNCTION_ARGS);
+Datum bm25_phrase_text_text_match(PG_FUNCTION_ARGS);
 Datum tpquery_eq(PG_FUNCTION_ARGS);
 
 /* Utility functions */
 TpQuery *create_tpquery(const char *query_text, Oid index_oid);
 TpQuery *create_tpquery_explicit(
 		const char *query_text, Oid index_oid, bool explicit_index);
+TpQuery *create_tpquery_with_mode(
+		const char *query_text,
+		Oid			index_oid,
+		bool		explicit_index,
+		TpQueryMode	mode);
 TpQuery		  *
 create_tpquery_from_name(const char *query_text, const char *index_name);
 Oid	  get_tpquery_index_oid(TpQuery *tpquery);
 char *get_tpquery_text(TpQuery *tpquery);
 bool  tpquery_has_index(TpQuery *tpquery);
 bool  tpquery_is_explicit_index(TpQuery *tpquery);
+bool  tpquery_is_phrase(TpQuery *tpquery);
+TpParsedQuery *tp_parse_query_text(
+		const char *query_text, Oid text_config_oid, TpQueryMode mode);
+void		   tp_free_parsed_query(TpParsedQuery *parsed_query);
+bool tp_phrase_match_document_text(
+		text *document_text,
+		const char *query_text,
+		Oid		text_config_oid);
+bool tp_verify_phrase_with_tpvector(
+		TpVector   *tpvec,
+		const char *query_text,
+		Oid			text_config_oid);

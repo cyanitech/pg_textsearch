@@ -172,6 +172,125 @@ tp_do_spill(
 	tp_memtable_chain_source_extract(
 			src, CurrentMemoryContext, &terms, &num_terms, &docmap);
 
+	/*
+	 * Populate position arrays on TermInfo by re-walking the
+	 * chain.  Each doc record carries a TpVector whose position
+	 * sidecar contains per-lexeme position lists.
+	 */
+	if (num_terms > 0)
+	{
+		TpChainWalker	*walker;
+		TpChainWalkerRecord rec;
+		TpIndexMetaPage	*metap;
+
+		metap = tp_get_metapage(index_rel);
+		if (metap != NULL &&
+			metap->memtable_head_blkno != InvalidBlockNumber)
+		{
+			walker = tp_chain_walker_open(
+					index_rel,
+					metap->memtable_head_blkno,
+					0,
+					CurrentMemoryContext);
+
+			while (tp_chain_walker_next(walker, &rec))
+			{
+				TpVector		*vec;
+				TpVectorEntry	*entry;
+				uint32			 entry_idx;
+				ItemPointerData	 lookup_key;
+				bool			 found;
+				uint32			 k;
+
+				vec = (TpVector *)rec.vector_bytes;
+				if (!tpvector_has_positions(vec))
+					continue;
+
+				entry = get_tpvector_first_entry(vec);
+				for (entry_idx = 0; entry_idx < vec->entry_count;
+					 entry_idx++)
+				{
+					TpVectorEntryView view;
+					TermInfo		 *ti;
+					uint32			  ti_idx;
+
+					entry = tpvector_entry_decode_advance(entry, &view);
+
+					/* Binary search for term in terms[] */
+					{
+						int lo = 0, hi = (int)num_terms - 1;
+
+						while (lo <= hi)
+						{
+							int mid = (lo + hi) / 2;
+							int cmp = strncmp(view.lexeme,
+									terms[mid].term, view.lexeme_len);
+
+							if (cmp == 0 &&
+								terms[mid].term_len == view.lexeme_len)
+							{
+								ti_idx = (uint32)mid;
+								goto term_found;
+							}
+							if (cmp < 0)
+								hi = mid - 1;
+							else
+								lo = mid + 1;
+						}
+						continue; /* term not in dictionary (unlikely) */
+					}
+
+term_found:
+					ti = &terms[ti_idx];
+
+					/*
+					 * Lazy-allocate position arrays for this term.
+					 */
+					if (ti->positions == NULL)
+					{
+						ti->positions = (uint16 **)palloc0(
+								ti->count * sizeof(uint16 *));
+						ti->position_counts = (uint32 *)palloc0(
+								ti->count * sizeof(uint32));
+					}
+
+					/* Binary search for this ctid in ti->ctids[] */
+					lookup_key = rec.ctid;
+					{
+						int lo = 0, hi = (int)ti->count - 1;
+
+						while (lo <= hi)
+						{
+							int mid = (lo + hi) / 2;
+							int cmp = memcmp(
+									&ti->ctids[mid], &lookup_key,
+									sizeof(ItemPointerData));
+
+							if (cmp == 0)
+							{
+								uint16 *pos;
+								uint32  pc;
+
+								tpvector_get_entry_positions(
+										vec, entry_idx, &pos, &pc);
+								ti->positions[mid] = pos;
+								ti->position_counts[mid] = pc;
+								break;
+							}
+							if (cmp < 0)
+								lo = mid + 1;
+							else
+								hi = mid - 1;
+						}
+					}
+				}
+			}
+
+			tp_chain_walker_close(walker);
+		}
+		if (metap) pfree(metap);
+	}
+
 	if (num_terms == 0)
 	{
 		/*
@@ -769,6 +888,77 @@ tp_extract_terms_from_tsvector(
 	return doc_length;
 }
 
+int
+tp_extract_terms_and_positions_from_tsvector(
+		TSVector tsvector,
+		char	 ***terms_out,
+		int32	 **frequencies_out,
+		uint16 ***positions_out,
+		uint32  **position_counts_out,
+		int		 *term_count_out)
+{
+	int		   term_count = tsvector->size;
+	char	 **terms;
+	int32	  *frequencies;
+	uint16	 **positions;
+	uint32	  *position_counts;
+	int		   doc_length = 0;
+	WordEntry *we;
+
+	*term_count_out = term_count;
+
+	if (term_count == 0)
+	{
+		*terms_out = NULL;
+		*frequencies_out = NULL;
+		*positions_out = NULL;
+		*position_counts_out = NULL;
+		return 0;
+	}
+
+	we = ARRPTR(tsvector);
+	terms = palloc(term_count * sizeof(char *));
+	frequencies = palloc(term_count * sizeof(int32));
+	positions = palloc0(term_count * sizeof(uint16 *));
+	position_counts = palloc0(term_count * sizeof(uint32));
+
+	for (int i = 0; i < term_count; i++)
+	{
+		char *lexeme_start = STRPTR(tsvector) + we[i].pos;
+		int   lexeme_len = we[i].len;
+		char *lexeme = palloc(lexeme_len + 1);
+
+		memcpy(lexeme, lexeme_start, lexeme_len);
+		lexeme[lexeme_len] = '\0';
+		terms[i] = lexeme;
+
+		if (we[i].haspos)
+		{
+			WordEntryPos *posdata = POSDATAPTR(tsvector, &we[i]);
+			uint32 count = (uint32)POSDATALEN(tsvector, &we[i]);
+
+			frequencies[i] = (int32)count;
+			position_counts[i] = count;
+			positions[i] = palloc(count * sizeof(uint16));
+			for (uint32 j = 0; j < count; j++)
+				positions[i][j] = (uint16)WEP_GETPOS(posdata[j]);
+		}
+		else
+		{
+			frequencies[i] = 1;
+		}
+
+		doc_length += frequencies[i];
+	}
+
+	*terms_out = terms;
+	*frequencies_out = frequencies;
+	*positions_out = positions;
+	*position_counts_out = position_counts;
+
+	return doc_length;
+}
+
 /*
  * Free memory allocated for terms array
  */
@@ -1040,6 +1230,59 @@ tp_tokenize_text(
 	return doc_length;
 }
 
+int
+tp_tokenize_text_with_positions(
+		text	   *document_text,
+		Oid		text_config_oid,
+		char	***terms_out,
+		int32	**frequencies_out,
+		uint16 ***positions_out,
+		uint32 **position_counts_out,
+		int	   *term_count_out)
+{
+	const char *data = VARDATA_ANY(document_text);
+	int		 len = VARSIZE_ANY_EXHDR(document_text);
+
+	if (len > TP_TSVECTOR_CHUNK_BYTES)
+	{
+		int doc_length = tp_tokenize_text(
+				document_text,
+				text_config_oid,
+				terms_out,
+				frequencies_out,
+				term_count_out);
+
+		if (*term_count_out > 0)
+		{
+			*positions_out = palloc0(*term_count_out * sizeof(uint16 *));
+			*position_counts_out = palloc0(*term_count_out * sizeof(uint32));
+		}
+		else
+		{
+			*positions_out = NULL;
+			*position_counts_out = NULL;
+		}
+		return doc_length;
+	}
+
+	(void)data;
+	{
+		Datum tsvector_datum = DirectFunctionCall2Coll(
+				to_tsvector_byid,
+				InvalidOid,
+				ObjectIdGetDatum(text_config_oid),
+				PointerGetDatum(document_text));
+		TSVector tsvector = DatumGetTSVector(tsvector_datum);
+		return tp_extract_terms_and_positions_from_tsvector(
+				tsvector,
+				terms_out,
+				frequencies_out,
+				positions_out,
+				position_counts_out,
+				term_count_out);
+	}
+}
+
 /*
  * Core document processing: convert text to terms and add to posting lists.
  * This is shared between CREATE INDEX build (heap scan) and DML inserts
@@ -1060,6 +1303,8 @@ tp_process_document_text(
 	char  *document_str;
 	char **terms;
 	int32 *frequencies;
+	uint16 **positions;
+	uint32 *position_counts;
 	int	   term_count;
 	int	   doc_length;
 
@@ -1078,16 +1323,27 @@ tp_process_document_text(
 	}
 
 	/* Tokenize document (chunks oversized inputs to fit tsvector cap) */
-	doc_length = tp_tokenize_text(
-			document_text, text_config_oid, &terms, &frequencies, &term_count);
+	doc_length = tp_tokenize_text_with_positions(
+			document_text,
+			text_config_oid,
+			&terms,
+			&frequencies,
+			&positions,
+			&position_counts,
+			&term_count);
 
 	if (term_count > 0 && index_rel != NULL)
 	{
 		char	 *index_name = get_rel_name(RelationGetRelid(index_rel));
 		TpVector *tpvec;
 
-		tpvec = create_tpvector_from_strings(
-				index_name, term_count, (const char **)terms, frequencies);
+		tpvec = create_tpvector_with_positions(
+				index_name,
+				term_count,
+				(const char **)terms,
+				frequencies,
+				positions,
+				position_counts);
 		pfree(index_name);
 
 		/*
@@ -1108,6 +1364,17 @@ tp_process_document_text(
 		tp_auto_spill_if_needed(index_state, index_rel);
 
 		pfree(tpvec);
+		if (positions != NULL)
+		{
+			for (int i = 0; i < term_count; i++)
+			{
+				if (positions[i] != NULL)
+					pfree(positions[i]);
+			}
+			pfree(positions);
+		}
+		if (position_counts != NULL)
+			pfree(position_counts);
 		tp_free_terms_array(terms, term_count);
 		pfree(frequencies);
 	}
@@ -1118,6 +1385,17 @@ tp_process_document_text(
 		 * the rebuild function is short-circuited and never
 		 * reaches here, but we keep the cleanup path correct.
 		 */
+		if (positions != NULL)
+		{
+			for (int i = 0; i < term_count; i++)
+			{
+				if (positions[i] != NULL)
+					pfree(positions[i]);
+			}
+			pfree(positions);
+		}
+		if (position_counts != NULL)
+			pfree(position_counts);
 		tp_free_terms_array(terms, term_count);
 		pfree(frequencies);
 	}

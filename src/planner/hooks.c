@@ -64,6 +64,11 @@ typedef struct BM25OidCache
 	Oid text_text_operator_oid;
 	Oid textarray_tpquery_operator_oid;
 	Oid textarray_text_operator_oid;
+	Oid phrase_tpquery_operator_oid;
+	Oid phrase_text_operator_oid;
+	Oid pcteq_operator_oid;			/* %= */
+	Oid pcteq_func_oid;				/* bm25_pcteq_always_true() */
+	Oid current_score_func_oid;		/* bm25_get_current_score() */
 } BM25OidCache;
 
 /*
@@ -184,6 +189,39 @@ lookup_bm25_oids_internal(BM25OidCache *cache)
 	cache->textarray_text_operator_oid =
 			OpernameGetOprid(opname, TEXTARRAYOID, TEXTOID);
 	list_free(opname);
+
+	/* Look up the == operator for (text, bm25query) */
+	opname = list_make1(makeString("=="));
+	cache->phrase_tpquery_operator_oid =
+			OpernameGetOprid(opname, TEXTOID, cache->tpquery_type_oid);
+	list_free(opname);
+
+	/* Look up the == operator for (text, text) */
+	opname = list_make1(makeString("=="));
+	cache->phrase_text_operator_oid =
+			OpernameGetOprid(opname, TEXTOID, TEXTOID);
+	list_free(opname);
+
+	/* Look up the %= operator for (text, text) */
+	opname = list_make1(makeString("%="));
+	cache->pcteq_operator_oid =
+			OpernameGetOprid(opname, TEXTOID, TEXTOID);
+	list_free(opname);
+
+	/* Look up bm25_pcteq_always_true() function */
+	{
+		List *funcname = list_make2(makeString("pg_catalog"), 
+									makeString("bm25_pcteq_always_true"));
+		cache->pcteq_func_oid = LookupFuncName(funcname, 0, NULL, false);
+		list_free(funcname);
+	}
+
+	/* Look up bm25_get_current_score() function */
+	{
+		List *funcname = list_make1(makeString("bm25_get_current_score"));
+		cache->current_score_func_oid = LookupFuncName(funcname, 0, NULL, false);
+		list_free(funcname);
+	}
 
 	return true;
 }
@@ -612,7 +650,11 @@ create_resolved_tpquery_const(Const *original, Oid index_oid)
 {
 	TpQuery *old_tpquery = (TpQuery *)DatumGetPointer(original->constvalue);
 	char	*query_text	 = get_tpquery_text(old_tpquery);
-	TpQuery *new_tpquery = create_tpquery(query_text, index_oid);
+	TpQuery *new_tpquery = create_tpquery_with_mode(
+			query_text,
+			index_oid,
+			tpquery_is_explicit_index(old_tpquery),
+			tpquery_is_phrase(old_tpquery) ? TP_QUERY_PHRASE : TP_QUERY_FUZZY);
 
 	return makeConst(
 			original->consttype,
@@ -631,10 +673,11 @@ static OpExpr *
 create_opexpr(Oid opno, Node *left, Node *right, Oid inputcollid, int location)
 {
 	OpExpr *new_opexpr = makeNode(OpExpr);
+	Oid	 opfuncid = get_opcode(opno);
 
 	new_opexpr->opno		 = opno;
-	new_opexpr->opfuncid	 = get_opcode(opno);
-	new_opexpr->opresulttype = FLOAT8OID;
+	new_opexpr->opfuncid	 = opfuncid;
+	new_opexpr->opresulttype = get_func_rettype(opfuncid);
 	new_opexpr->opretset	 = false;
 	new_opexpr->opcollid	 = InvalidOid;
 	new_opexpr->inputcollid	 = inputcollid;
@@ -659,10 +702,14 @@ transform_tpquery_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 	TpQuery		 *tpquery;
 	Oid			  index_oid;
 	Const		 *new_const;
+	bool		  is_phrase_op;
 
 	if (opexpr->opno != oids->text_tpquery_operator_oid &&
-		opexpr->opno != oids->textarray_tpquery_operator_oid)
+		opexpr->opno != oids->textarray_tpquery_operator_oid &&
+		opexpr->opno != oids->phrase_tpquery_operator_oid)
 		return NULL;
+
+	is_phrase_op = (opexpr->opno == oids->phrase_tpquery_operator_oid);
 
 	/* Mark that we found a BM25 operator for later optimization */
 	context->found_bm25_operator = true;
@@ -695,10 +742,12 @@ transform_tpquery_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("left operand of <@> must reference "
+				 errmsg("left operand of %s must reference "
 						"a table column"),
-				 errhint("Use column_name <@> bm25query, not "
+				 is_phrase_op ? "==" : "<@>"),
+				 errhint("Use column_name %s bm25query, not "
 						 "a constant.")));
+				 is_phrase_op ? "==" : "<@>"));
 	}
 
 	/*
@@ -802,8 +851,10 @@ transform_text_text_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 	Const		 *tpquery_const;
 	bool		  is_text_array_op =
 			(opexpr->opno == oids->textarray_text_operator_oid);
+	bool		  is_phrase_op = (opexpr->opno == oids->phrase_text_operator_oid);
 
-	if (opexpr->opno != oids->text_text_operator_oid && !is_text_array_op)
+	if (opexpr->opno != oids->text_text_operator_oid && !is_text_array_op &&
+		opexpr->opno != oids->phrase_text_operator_oid)
 		return NULL;
 
 	/* Mark that we found a BM25 operator for later optimization */
@@ -829,10 +880,12 @@ transform_text_text_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("left operand of <@> must reference "
+				 errmsg("left operand of %s must reference "
 						"a table column"),
-				 errhint("Use column_name <@> 'query text', "
+				 is_phrase_op ? "==" : "<@>"),
+				 errhint("Use column_name %s 'query text', "
 						 "not a constant.")));
+				 is_phrase_op ? "==" : "<@>"));
 	}
 
 	/* Find index: plain column or expression */
@@ -857,7 +910,11 @@ transform_text_text_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 		return NULL;
 
 	query_text = TextDatumGetCString(text_const->constvalue);
-	tpquery	   = create_tpquery(query_text, index_oid);
+	tpquery	   = create_tpquery_with_mode(
+			query_text,
+			index_oid,
+			false,
+			is_phrase_op ? TP_QUERY_PHRASE : TP_QUERY_FUZZY);
 	pfree(query_text);
 
 	tpquery_const = makeConst(
@@ -870,8 +927,9 @@ transform_text_text_opexpr(OpExpr *opexpr, ResolveIndexContext *context)
 			false);
 
 	return (Node *)create_opexpr(
-			is_text_array_op ? oids->textarray_tpquery_operator_oid
-							 : oids->text_tpquery_operator_oid,
+			is_phrase_op ? oids->phrase_tpquery_operator_oid
+						 : (is_text_array_op ? oids->textarray_tpquery_operator_oid
+											 : oids->text_tpquery_operator_oid),
 			left,
 			(Node *)tpquery_const,
 			opexpr->inputcollid,
@@ -970,6 +1028,434 @@ resolve_indexes_in_subqueries(Query *query)
 	}
 }
 
+/*
+ * Walker context for finding %= operator in WHERE clause.
+ */
+typedef struct FindPctEqContext
+{
+	Oid		pcteq_oid;
+	Node   *col_expr;
+	char   *query_text;
+	OpExpr *pcteq_node;
+} FindPctEqContext;
+
+typedef struct FindPhraseContext
+{
+	Oid		phrase_oid;
+	Node   *col_expr;
+	char   *query_text;
+	OpExpr *phrase_node;
+} FindPhraseContext;
+
+static bool
+find_pcteq_walker(Node *node, FindPctEqContext *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *op = (OpExpr *)node;
+
+		if (op->opno == ctx->pcteq_oid && list_length(op->args) == 2)
+		{
+			Node *right = lsecond(op->args);
+
+			if (IsA(right, Const))
+			{
+				Const *c = (Const *)right;
+
+				if (c->consttype == TEXTOID && !c->constisnull)
+				{
+					ctx->col_expr   = linitial(op->args);
+					ctx->query_text = TextDatumGetCString(
+							DatumGetPointer(c->constvalue));
+					ctx->pcteq_node = op;
+					return true;
+				}
+			}
+		}
+	}
+	return expression_tree_walker(node, find_pcteq_walker, ctx);
+}
+
+static bool
+find_phrase_walker(Node *node, FindPhraseContext *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, OpExpr))
+	{
+		OpExpr *op = (OpExpr *)node;
+
+		if (op->opno == ctx->phrase_oid && list_length(op->args) == 2)
+		{
+			Node *right = lsecond(op->args);
+
+			if (IsA(right, Const))
+			{
+				Const *c = (Const *)right;
+
+				if (c->consttype == TEXTOID && !c->constisnull)
+				{
+					ctx->col_expr = linitial(op->args);
+					ctx->query_text = TextDatumGetCString(
+							DatumGetPointer(c->constvalue));
+					ctx->phrase_node = op;
+					return true;
+				}
+			}
+		}
+	}
+	return expression_tree_walker(node, find_phrase_walker, ctx);
+}
+
+/*
+ * Remove a specific OpExpr from a boolean AND tree.
+ * Returns the modified root (may be NULL if tree becomes empty).
+ */
+static Node *
+remove_qual_node(Node *root, OpExpr *target)
+{
+	if (root == NULL)
+		return NULL;
+	if (root == (Node *)target)
+		return NULL;
+
+	if (IsA(root, BoolExpr))
+	{
+		BoolExpr *b = (BoolExpr *)root;
+
+		if (b->boolop == AND_EXPR)
+		{
+			List *new_args = NIL;
+			ListCell *lc;
+
+			foreach (lc, b->args)
+			{
+				Node *arg = (Node *)lfirst(lc);
+
+				if (arg == (Node *)target)
+					continue;
+				new_args = lappend(new_args, arg);
+			}
+			if (list_length(new_args) == 0)
+				return NULL;
+			if (list_length(new_args) == 1)
+				return (Node *)linitial(new_args);
+			b->args = new_args;
+			return root;
+		}
+	}
+	return root;
+}
+
+/*
+ * Rewrite WHERE col %= 'query' ORDER BY score
+ *   → ORDER BY col <@> bm25query, with bm25_get_current_score() AS score.
+ *
+ * Pure syntactic sugar — all real work delegates to the existing <@>
+ * infrastructure (index resolution, BMW scan, score replacement).
+ */
+static void
+rewrite_percent_eq_query(Query *query, BM25OidCache *oid_cache)
+{
+	FindPctEqContext pctx;
+	Oid				 index_oid;
+	TpQuery			*tpquery;
+	Const			*tpquery_const;
+	OpExpr			*orderby_op;
+	SortGroupClause *sgc;
+	TargetEntry		*score_tle;
+	FuncExpr		*score_func;
+	ListCell		*lc;
+	bool			found_score_alias = false;
+
+	if (!OidIsValid(oid_cache->pcteq_operator_oid))
+		return;
+
+	/* Walk WHERE looking for col %= 'query' */
+	memset(&pctx, 0, sizeof(pctx));
+	pctx.pcteq_oid = oid_cache->pcteq_operator_oid;
+
+	if (query->jointree && query->jointree->quals)
+		find_pcteq_walker((Node *)query->jointree->quals, &pctx);
+
+	if (pctx.query_text == NULL)
+		return;
+
+	/*
+	 * Step 1: Resolve BM25 index FIRST — only proceed with rewrite if
+	 * a BM25 index exists for this column.  This also handles the
+	 * multi-extension scenario: if another extension defines %= and
+	 * there is no BM25 index, we leave %= untouched so it can fall
+	 * through to the other extension or produce a natural error.
+	 */
+	if (IsA(pctx.col_expr, Var))
+	{
+		Oid			relid;
+		AttrNumber	attnum;
+
+		if (get_var_relation_and_attnum(
+					(Var *)pctx.col_expr, query, &relid, &attnum))
+			index_oid = find_bm25_index_for_column(
+					relid, attnum, oid_cache->bm25_am_oid);
+		else
+			index_oid = InvalidOid;
+	}
+	else
+	{
+		Index varno;
+		Oid	  relid;
+
+		relid = get_expr_relid(pctx.col_expr, query, &varno);
+		if (OidIsValid(relid))
+			index_oid = find_bm25_index_for_expr(
+					pctx.col_expr, relid, varno,
+					oid_cache->bm25_am_oid);
+		else
+			index_oid = InvalidOid;
+	}
+
+	if (!OidIsValid(index_oid))
+	{
+		/* No BM25 index → leave %= untouched for other extensions */
+		pfree(pctx.query_text);
+		return;
+	}
+
+	/* Step 2: Now remove %= from WHERE (only after confirming rewrite) */
+	query->jointree->quals =
+			remove_qual_node(query->jointree->quals, pctx.pcteq_node);
+
+	/* Step 3: Build ORDER BY col <@> bm25query */
+	tpquery	= create_tpquery(pctx.query_text, index_oid);
+	pfree(pctx.query_text);
+
+	tpquery_const = makeConst(
+			oid_cache->tpquery_type_oid,
+			-1, InvalidOid, -1,
+			PointerGetDatum(tpquery),
+			false, false);
+
+	orderby_op = create_opexpr(
+			oid_cache->text_tpquery_operator_oid,
+			copyObject(pctx.col_expr),
+			(Node *)tpquery_const,
+			InvalidOid, -1);
+
+	sgc = makeNode(SortGroupClause);
+	sgc->tleSortGroupRef = 0;
+	sgc->eqop			 = FLOAT8EQOID;
+	sgc->sortop			 = FLOAT8LTOID;
+	sgc->nulls_first	 = false;
+	sgc->hashable		 = false;
+
+	query->sortClause = list_make1(sgc);
+
+	/* Step 4: Replace/add bm25_get_current_score() AS score in target list */
+	foreach (lc, query->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *)lfirst(lc);
+
+		if (tle->resname != NULL && strcmp(tle->resname, "score") == 0)
+		{
+			score_func = makeNode(FuncExpr);
+			score_func->funcid		   = oid_cache->current_score_func_oid;
+			score_func->funcresulttype = FLOAT8OID;
+			score_func->funcretset	   = false;
+			score_func->funcvariadic   = false;
+			score_func->funcformat	   = COERCE_EXPLICIT_CALL;
+			score_func->funccollid	   = InvalidOid;
+			score_func->inputcollid	   = InvalidOid;
+			score_func->args		   = NIL;
+			score_func->location	   = -1;
+			tle->expr = (Expr *)score_func;
+			found_score_alias = true;
+			break;
+		}
+	}
+
+	if (!found_score_alias)
+	{
+		score_func = makeNode(FuncExpr);
+		score_func->funcid		   = oid_cache->current_score_func_oid;
+		score_func->funcresulttype = FLOAT8OID;
+		score_func->funcretset	   = false;
+		score_func->funcvariadic   = false;
+		score_func->funcformat	   = COERCE_EXPLICIT_CALL;
+		score_func->funccollid	   = InvalidOid;
+		score_func->inputcollid	   = InvalidOid;
+		score_func->args		   = NIL;
+		score_func->location	   = -1;
+
+		score_tle = makeTargetEntry(
+				(Expr *)score_func,
+				list_length(query->targetList) + 1,
+				pstrdup("score"),
+				false);
+		query->targetList = lappend(query->targetList, score_tle);
+	}
+
+	/* Add resjunk ORDER BY expression to target list */
+	{
+		TargetEntry *order_tle;
+
+		order_tle = makeTargetEntry(
+				(Expr *)orderby_op,
+				list_length(query->targetList) + 1,
+				pstrdup("bm25_score_ord"),
+				true);
+
+		query->targetList = lappend(query->targetList, order_tle);
+		sgc->tleSortGroupRef = order_tle->ressortgroupref =
+				list_length(query->targetList);
+	}
+}
+
+static void
+rewrite_phrase_query(Query *query, BM25OidCache *oid_cache)
+{
+	FindPhraseContext pctx;
+	Oid				 index_oid;
+	TpQuery			*tpquery;
+	Const			*tpquery_const;
+	OpExpr			*orderby_op;
+	SortGroupClause *sgc;
+	TargetEntry		*score_tle;
+	FuncExpr		*score_func;
+	ListCell		*lc;
+	bool			 found_score_alias = false;
+
+	if (!OidIsValid(oid_cache->phrase_text_operator_oid) ||
+		query->sortClause == NIL)
+		return;
+
+	memset(&pctx, 0, sizeof(pctx));
+	pctx.phrase_oid = oid_cache->phrase_text_operator_oid;
+
+	if (query->jointree && query->jointree->quals)
+		find_phrase_walker((Node *)query->jointree->quals, &pctx);
+
+	if (pctx.query_text == NULL)
+		return;
+
+	if (IsA(pctx.col_expr, Var))
+	{
+		Oid		 relid;
+		AttrNumber attnum;
+
+		if (get_var_relation_and_attnum(
+					(Var *)pctx.col_expr, query, &relid, &attnum))
+			index_oid = find_bm25_index_for_column(
+					relid, attnum, oid_cache->bm25_am_oid);
+		else
+			index_oid = InvalidOid;
+	}
+	else
+	{
+		Index varno;
+		Oid   relid;
+
+		relid = get_expr_relid(pctx.col_expr, query, &varno);
+		if (OidIsValid(relid))
+			index_oid = find_bm25_index_for_expr(
+					pctx.col_expr, relid, varno, oid_cache->bm25_am_oid);
+		else
+			index_oid = InvalidOid;
+	}
+
+	if (!OidIsValid(index_oid))
+	{
+		pfree(pctx.query_text);
+		return;
+	}
+
+	tpquery = create_tpquery_with_mode(
+			pctx.query_text, index_oid, false, TP_QUERY_PHRASE);
+	pfree(pctx.query_text);
+
+	tpquery_const = makeConst(
+			oid_cache->tpquery_type_oid,
+			-1,
+			InvalidOid,
+			-1,
+			PointerGetDatum(tpquery),
+			false,
+			false);
+
+	orderby_op = create_opexpr(
+			oid_cache->text_tpquery_operator_oid,
+			copyObject(pctx.col_expr),
+			(Node *)tpquery_const,
+			InvalidOid,
+			-1);
+
+	sgc = makeNode(SortGroupClause);
+	sgc->tleSortGroupRef = 0;
+	sgc->eqop			 = FLOAT8EQOID;
+	sgc->sortop			 = FLOAT8LTOID;
+	sgc->nulls_first	 = false;
+	sgc->hashable		 = false;
+	query->sortClause = list_make1(sgc);
+
+	foreach (lc, query->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *)lfirst(lc);
+
+		if (tle->resname != NULL && strcmp(tle->resname, "score") == 0)
+		{
+			score_func = makeNode(FuncExpr);
+			score_func->funcid		   = oid_cache->current_score_func_oid;
+			score_func->funcresulttype = FLOAT8OID;
+			score_func->funcretset	   = false;
+			score_func->funcvariadic   = false;
+			score_func->funcformat	   = COERCE_EXPLICIT_CALL;
+			score_func->funccollid	   = InvalidOid;
+			score_func->inputcollid	   = InvalidOid;
+			score_func->args		   = NIL;
+			score_func->location	   = -1;
+			tle->expr = (Expr *)score_func;
+			found_score_alias = true;
+			break;
+		}
+	}
+
+	if (!found_score_alias)
+	{
+		score_func = makeNode(FuncExpr);
+		score_func->funcid		   = oid_cache->current_score_func_oid;
+		score_func->funcresulttype = FLOAT8OID;
+		score_func->funcretset	   = false;
+		score_func->funcvariadic   = false;
+		score_func->funcformat	   = COERCE_EXPLICIT_CALL;
+		score_func->funccollid	   = InvalidOid;
+		score_func->inputcollid	   = InvalidOid;
+		score_func->args		   = NIL;
+		score_func->location	   = -1;
+
+		score_tle = makeTargetEntry(
+				(Expr *)score_func,
+				list_length(query->targetList) + 1,
+				pstrdup("score"),
+				false);
+		query->targetList = lappend(query->targetList, score_tle);
+	}
+
+	{
+		TargetEntry *order_tle;
+
+		order_tle = makeTargetEntry(
+				(Expr *)orderby_op,
+				list_length(query->targetList) + 1,
+				pstrdup("bm25_phrase_ord"),
+				true);
+
+		query->targetList = lappend(query->targetList, order_tle);
+		sgc->tleSortGroupRef = order_tle->ressortgroupref =
+				list_length(query->targetList);
+	}
+}
+
 static void
 resolve_indexes_in_query(Query *query)
 {
@@ -978,6 +1464,13 @@ resolve_indexes_in_query(Query *query)
 
 	if (!get_bm25_oids(&oid_cache))
 		return;
+
+	/*
+	 * Rewrite %= syntax before normal index resolution.
+	 * WHERE col %= 'query' ORDER BY score  →  ORDER BY col <@> bm25query
+	 */
+	rewrite_percent_eq_query(query, &oid_cache);
+	rewrite_phrase_query(query, &oid_cache);
 
 	context.query				= query;
 	context.oid_cache			= &oid_cache;
