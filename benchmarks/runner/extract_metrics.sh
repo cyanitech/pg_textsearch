@@ -1,0 +1,265 @@
+#!/bin/bash
+# Extract benchmark metrics from log output and create JSON summary
+#
+# Usage: ./extract_metrics.sh <log> <output_json> [dataset_name] [section]
+#
+# If section is specified (e.g., "Cranfield", "MS MARCO", "Wikipedia"),
+# only extracts metrics from that section of the log file.
+#
+# Parses benchmark output to extract:
+# - Index build time
+# - Query latencies by token bucket (p50/p95/p99)
+# - Throughput metrics
+# - Index/table sizes
+
+set -e
+
+LOG_FILE="${1:-benchmark_results.txt}"
+OUTPUT_FILE="${2:-benchmark_metrics.json}"
+DATASET_NAME="${3:-unknown}"
+SECTION="${4:-}"
+
+# If section specified, extract only that section from log
+if [ -n "$SECTION" ]; then
+    TEMP_LOG=$(mktemp)
+    awk -v section="$SECTION" '
+        /^=== .* Benchmark ===/ {
+            if (index($0, section) > 0) { capture = 1 }
+            else if (capture) { exit }
+        }
+        capture { print }
+    ' "$LOG_FILE" > "$TEMP_LOG"
+    LOG_FILE="$TEMP_LOG"
+    trap "rm -f $TEMP_LOG" EXIT
+fi
+
+# Helper to output number or null
+num_or_null() {
+    if [ -n "$1" ] && [[ "$1" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        echo "$1"
+    else
+        echo "null"
+    fi
+}
+
+# Extract index build time (from CREATE INDEX timing)
+INDEX_BUILD_MS=$(grep -E "CREATE INDEX" "$LOG_FILE" -A 1 2>/dev/null | \
+    grep -oE "Time: [0-9]+\.[0-9]+ ms" | head -1 | grep -oE "[0-9]+\.[0-9]+" || echo "")
+
+# Add post-build VACUUM time if present (ParadeDB segment compaction)
+INDEX_VACUUM_MS=$(grep -E "^INDEX_VACUUM:" "$LOG_FILE" -A 2 2>/dev/null | \
+    grep -oE "Time: [0-9]+\.[0-9]+ ms" | head -1 | grep -oE "[0-9]+\.[0-9]+" || echo "")
+if [ -n "$INDEX_VACUUM_MS" ] && [ -n "$INDEX_BUILD_MS" ]; then
+    INDEX_BUILD_MS=$(echo "$INDEX_BUILD_MS + $INDEX_VACUUM_MS" | bc)
+fi
+
+# Extract data load time (COPY statements)
+LOAD_TIME_MS=$(grep -E "^COPY [0-9]+" "$LOG_FILE" -A 1 2>/dev/null | \
+    grep -oE "Time: [0-9]+\.[0-9]+ ms" | head -1 | grep -oE "[0-9]+\.[0-9]+" || echo "")
+
+# Extract insert time (for insert-based benchmarks)
+# INSERT_TIME: marker appears before the COPY/INSERT block
+INSERT_TIME_MS=$(grep -E "INSERT_TIME:" "$LOG_FILE" -A 10 2>/dev/null | \
+    grep -oE "Time: [0-9]+\.[0-9]+ ms" | head -1 | \
+    grep -oE "[0-9]+\.[0-9]+" || echo "")
+
+# Extract concurrent insert time (wall-clock from pgbench)
+# Format: CONCURRENT_INSERT_TIME: XXXms
+CONCURRENT_INSERT_TIME_MS=$(grep -E "CONCURRENT_INSERT_TIME:" \
+    "$LOG_FILE" 2>/dev/null | \
+    grep -oE "[0-9]+\.[0-9]+" | head -1 || echo "")
+
+# Extract document count
+# Try pg_textsearch format first
+NUM_DOCUMENTS=$(grep -E "BM25 index build completed:" "$LOG_FILE" 2>/dev/null | \
+    grep -oE "[0-9]+ documents" | grep -oE "[0-9]+" || echo "")
+# Fallback: look for various "X loaded:" patterns in SQL output (Passages, Documents, Articles)
+if [ -z "$NUM_DOCUMENTS" ]; then
+    NUM_DOCUMENTS=$(grep -E "(Passages|Documents|Articles) loaded" "$LOG_FILE" 2>/dev/null | \
+        grep -oE "\| +[0-9]+" | grep -oE "[0-9]+" | head -1 || echo "")
+fi
+
+# Extract index and table sizes
+INDEX_SIZE=$(grep -E "INDEX_SIZE:" "$LOG_FILE" 2>/dev/null | \
+    grep -oE "[0-9]+ [kMGT]?B" | head -1 || echo "")
+INDEX_SIZE_BYTES=$(grep -E "INDEX_SIZE:" "$LOG_FILE" 2>/dev/null | \
+    awk '{print $NF}' | grep -E "^[0-9]+$" | head -1 || echo "")
+TABLE_SIZE=$(grep -E "TABLE_SIZE:" "$LOG_FILE" 2>/dev/null | \
+    grep -oE "[0-9]+ [kMGT]?B" | head -1 || echo "")
+TABLE_SIZE_BYTES=$(grep -E "TABLE_SIZE:" "$LOG_FILE" 2>/dev/null | \
+    awk '{print $NF}' | grep -E "^[0-9]+$" | head -1 || echo "")
+
+# Extract latency buckets (new format)
+# Format: LATENCY_BUCKET_N: p50=Xms p95=Yms p99=Zms avg=Wms (n=100)
+extract_bucket() {
+    local bucket=$1
+    # Validate bucket is an integer between 1 and 8
+    if ! [[ "$bucket" =~ ^[1-8]$ ]]; then
+        echo "null"
+        return 0
+    fi
+    local line=$(grep -E "LATENCY_BUCKET_${bucket}:" "$LOG_FILE" 2>/dev/null || echo "")
+    if [ -n "$line" ]; then
+        local p50=$(echo "$line" | grep -oE "p50=[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+        local p95=$(echo "$line" | grep -oE "p95=[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+        local p99=$(echo "$line" | grep -oE "p99=[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+        local avg=$(echo "$line" | grep -oE "avg=[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+        echo "{\"p50\": $(num_or_null "$p50"), \"p95\": $(num_or_null "$p95"), \"p99\": $(num_or_null "$p99"), \"avg\": $(num_or_null "$avg")}"
+    else
+        echo "null"
+    fi
+}
+
+BUCKET_1=$(extract_bucket 1)
+BUCKET_2=$(extract_bucket 2)
+BUCKET_3=$(extract_bucket 3)
+BUCKET_4=$(extract_bucket 4)
+BUCKET_5=$(extract_bucket 5)
+BUCKET_6=$(extract_bucket 6)
+BUCKET_7=$(extract_bucket 7)
+BUCKET_8=$(extract_bucket 8)
+
+# Extract throughput result
+# Format: "THROUGHPUT_RESULT: N queries in XXXX.XX ms (avg YY.YY ms/query)"
+THROUGHPUT_LINE=$(grep -E "THROUGHPUT_RESULT:" "$LOG_FILE" 2>/dev/null | head -1 || echo "")
+THROUGHPUT_TOTAL_MS=""
+THROUGHPUT_AVG_MS=""
+THROUGHPUT_NUM_QUERIES=""
+if [ -n "$THROUGHPUT_LINE" ]; then
+    THROUGHPUT_NUM_QUERIES=$(echo "$THROUGHPUT_LINE" | grep -oE "[0-9]+ queries" | grep -oE "[0-9]+" || echo "")
+    THROUGHPUT_TOTAL_MS=$(echo "$THROUGHPUT_LINE" | grep -oE "in [0-9]+\.[0-9]+ ms" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+    THROUGHPUT_AVG_MS=$(echo "$THROUGHPUT_LINE" | grep -oE "avg [0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+fi
+
+# Extract weighted-average latency
+# Format: "WEIGHTED_LATENCY_RESULT: weighted_p50=XX.XXms weighted_avg=YY.YYms"
+WEIGHTED_LINE=$(grep -E "WEIGHTED_LATENCY_RESULT:" "$LOG_FILE" 2>/dev/null | head -1 || echo "")
+WEIGHTED_P50_MS=""
+WEIGHTED_AVG_MS=""
+if [ -n "$WEIGHTED_LINE" ]; then
+    WEIGHTED_P50_MS=$(echo "$WEIGHTED_LINE" | grep -oE "weighted_p50=[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+    WEIGHTED_AVG_MS=$(echo "$WEIGHTED_LINE" | grep -oE "weighted_avg=[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+fi
+
+# Extract weighted throughput
+# Format: "WEIGHTED_THROUGHPUT_RESULT: XX.XX ms/query"
+WEIGHTED_THROUGHPUT_LINE=$(grep -E "WEIGHTED_THROUGHPUT_RESULT:" "$LOG_FILE" 2>/dev/null | head -1 || echo "")
+WEIGHTED_THROUGHPUT_MS=""
+if [ -n "$WEIGHTED_THROUGHPUT_LINE" ]; then
+    WEIGHTED_THROUGHPUT_MS=$(echo "$WEIGHTED_THROUGHPUT_LINE" | grep -oE "[0-9]+\.[0-9]+ ms/query" | grep -oE "[0-9]+\.[0-9]+" || echo "")
+fi
+
+# ============================================================
+# VACUUM benchmark metrics (from vacuum.sql output)
+# Scenarios: partial (concentrated), full (uniform), update
+# ============================================================
+
+# Extract timing between START/END markers using \timing output
+extract_marker_time() {
+    local start_marker="$1"
+    local end_marker="$2"
+    local time_val
+    time_val=$(sed -n "/${start_marker}/,/${end_marker}/p" "$LOG_FILE" 2>/dev/null | \
+        grep -oE "Time: [0-9]+\.[0-9]+ ms" | tail -1 | \
+        grep -oE "[0-9]+\.[0-9]+" || echo "")
+    echo "$time_val"
+}
+
+# Scenario A: Partial VACUUM (concentrated delete)
+VACUUM_PARTIAL_DELETE_MS=$(extract_marker_time "VACUUM_PARTIAL_DELETE_START:" "VACUUM_PARTIAL_DELETE_END:")
+VACUUM_PARTIAL_MS=$(extract_marker_time "VACUUM_PARTIAL_START:" "VACUUM_PARTIAL_END:")
+
+# Scenario B: Full VACUUM (uniform delete)
+VACUUM_FULL_DELETE_MS=$(extract_marker_time "VACUUM_FULL_DELETE_START:" "VACUUM_FULL_DELETE_END:")
+VACUUM_FULL_MS=$(extract_marker_time "VACUUM_FULL_START:" "VACUUM_FULL_END:")
+
+# Scenario C: Full VACUUM (uniform update)
+VACUUM_UPDATE_MS=$(extract_marker_time "VACUUM_UPDATE_START:" "VACUUM_UPDATE_END:")
+VACUUM_UPDATE_VACUUM_MS=$(extract_marker_time "VACUUM_UPDATE_VACUUM_START:" "VACUUM_UPDATE_VACUUM_END:")
+
+# Extract index sizes (bytes from last column of psql output)
+extract_index_bytes() {
+    local marker="$1"
+    grep -E "${marker}" "$LOG_FILE" 2>/dev/null | \
+        awk '{print $NF}' | grep -E "^[0-9]+$" | head -1 || echo ""
+}
+
+VACUUM_BASELINE_INDEX_BYTES=$(extract_index_bytes "VACUUM_BASELINE_INDEX_SIZE:")
+VACUUM_PARTIAL_POST_INDEX_BYTES=$(extract_index_bytes "VACUUM_PARTIAL_POST_INDEX_SIZE:")
+VACUUM_FULL_POST_INDEX_BYTES=$(extract_index_bytes "VACUUM_FULL_POST_INDEX_SIZE:")
+VACUUM_UPDATE_POST_INDEX_BYTES=$(extract_index_bytes "VACUUM_UPDATE_POST_INDEX_SIZE:")
+
+# Extract query latency averages per scenario
+# Format: VACUUM_*_QUERY: avg=Xms min=Yms max=Zms (n=N)
+extract_vacuum_query_avg() {
+    local marker="$1"
+    grep -E "${marker}" "$LOG_FILE" 2>/dev/null | \
+        grep -oE "avg=[0-9]+\.[0-9]+" | \
+        grep -oE "[0-9]+\.[0-9]+" | head -1 || echo ""
+}
+
+VACUUM_BASELINE_QUERY_AVG=$(extract_vacuum_query_avg "VACUUM_BASELINE_QUERY:")
+VACUUM_PARTIAL_QUERY_AVG=$(extract_vacuum_query_avg "VACUUM_PARTIAL_QUERY:")
+VACUUM_FULL_QUERY_AVG=$(extract_vacuum_query_avg "VACUUM_FULL_QUERY:")
+VACUUM_UPDATE_QUERY_AVG=$(extract_vacuum_query_avg "VACUUM_UPDATE_QUERY:")
+
+# Build JSON output
+cat > "$OUTPUT_FILE" << EOJSON
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "commit": "${GITHUB_SHA:-unknown}",
+  "dataset": "$DATASET_NAME",
+  "metrics": {
+    "load_time_ms": $(num_or_null "$LOAD_TIME_MS"),
+    "index_build_time_ms": $(num_or_null "$INDEX_BUILD_MS"),
+    "insert_time_ms": $(num_or_null "$INSERT_TIME_MS"),
+    "concurrent_insert_time_ms": $(num_or_null "$CONCURRENT_INSERT_TIME_MS"),
+    "num_documents": $(num_or_null "$NUM_DOCUMENTS"),
+    "index_size": "${INDEX_SIZE:-unknown}",
+    "index_size_bytes": $(num_or_null "$INDEX_SIZE_BYTES"),
+    "table_size": "${TABLE_SIZE:-unknown}",
+    "table_size_bytes": $(num_or_null "$TABLE_SIZE_BYTES"),
+    "latency_by_tokens": {
+      "bucket_1": $BUCKET_1,
+      "bucket_2": $BUCKET_2,
+      "bucket_3": $BUCKET_3,
+      "bucket_4": $BUCKET_4,
+      "bucket_5": $BUCKET_5,
+      "bucket_6": $BUCKET_6,
+      "bucket_7": $BUCKET_7,
+      "bucket_8": $BUCKET_8
+    },
+    "throughput": {
+      "num_queries": $(num_or_null "$THROUGHPUT_NUM_QUERIES"),
+      "total_ms": $(num_or_null "$THROUGHPUT_TOTAL_MS"),
+      "avg_ms_per_query": $(num_or_null "$THROUGHPUT_AVG_MS")
+    },
+    "weighted_latency": {
+      "weighted_p50_ms": $(num_or_null "$WEIGHTED_P50_MS"),
+      "weighted_avg_ms": $(num_or_null "$WEIGHTED_AVG_MS")
+    },
+    "weighted_throughput": {
+      "avg_ms_per_query": $(num_or_null "$WEIGHTED_THROUGHPUT_MS")
+    },
+    "vacuum": {
+      "partial_delete_ms": $(num_or_null "$VACUUM_PARTIAL_DELETE_MS"),
+      "partial_vacuum_ms": $(num_or_null "$VACUUM_PARTIAL_MS"),
+      "full_delete_ms": $(num_or_null "$VACUUM_FULL_DELETE_MS"),
+      "full_vacuum_ms": $(num_or_null "$VACUUM_FULL_MS"),
+      "update_ms": $(num_or_null "$VACUUM_UPDATE_MS"),
+      "update_vacuum_ms": $(num_or_null "$VACUUM_UPDATE_VACUUM_MS"),
+      "baseline_index_bytes": $(num_or_null "$VACUUM_BASELINE_INDEX_BYTES"),
+      "partial_post_index_bytes": $(num_or_null "$VACUUM_PARTIAL_POST_INDEX_BYTES"),
+      "full_post_index_bytes": $(num_or_null "$VACUUM_FULL_POST_INDEX_BYTES"),
+      "update_post_index_bytes": $(num_or_null "$VACUUM_UPDATE_POST_INDEX_BYTES"),
+      "baseline_query_avg_ms": $(num_or_null "$VACUUM_BASELINE_QUERY_AVG"),
+      "partial_query_avg_ms": $(num_or_null "$VACUUM_PARTIAL_QUERY_AVG"),
+      "full_query_avg_ms": $(num_or_null "$VACUUM_FULL_QUERY_AVG"),
+      "update_query_avg_ms": $(num_or_null "$VACUUM_UPDATE_QUERY_AVG")
+    }
+  }
+}
+EOJSON
+
+echo "Metrics extracted to $OUTPUT_FILE"
+cat "$OUTPUT_FILE"

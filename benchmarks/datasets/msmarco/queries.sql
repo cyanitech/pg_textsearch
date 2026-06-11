@@ -1,0 +1,271 @@
+-- MS MARCO Passage Ranking - Query Benchmarks
+-- Runs various query workloads against the indexed MS MARCO collection
+-- Outputs structured timing data for historical tracking
+
+\set ON_ERROR_STOP on
+\timing on
+
+-- Soft cap on per-statement runtime so a top-level psql query (e.g. the
+-- warmup DO block) can't hang forever. The benchmark loop functions
+-- (`benchmark_bucket`, `benchmark_throughput`) opt out of this cap
+-- locally so a slow-but-healthy run can complete and emit results;
+-- the workflow's step-level timeout-minutes is the real hang backstop.
+-- NOTE: statement_timeout cannot interrupt scans hung in pg_textsearch's
+-- BMW C-loop (no CHECK_FOR_INTERRUPTS) — for that case the workflow
+-- relies on a step-level timeout in benchmark.yml.
+SET statement_timeout = '5min';
+
+\echo '=== MS MARCO Query Benchmarks ==='
+\echo ''
+
+-- Load benchmark queries (pre-sampled by token count)
+\echo 'Loading benchmark queries...'
+DROP TABLE IF EXISTS benchmark_queries;
+CREATE TABLE benchmark_queries (
+    query_id INTEGER,
+    query_text TEXT,
+    token_bucket INTEGER
+);
+\copy benchmark_queries FROM 'benchmarks/datasets/msmarco/benchmark_queries.tsv' WITH (FORMAT text, DELIMITER E'\t')
+
+-- Verify load
+SELECT 'Loaded ' || COUNT(*) || ' benchmark queries' as status FROM benchmark_queries;
+SELECT token_bucket, COUNT(*) as count FROM benchmark_queries GROUP BY token_bucket ORDER BY token_bucket;
+
+-- Warm up: run queries from each bucket to ensure index is cached
+\echo ''
+\echo 'Warming up index...'
+DO $$
+DECLARE
+    q record;
+BEGIN
+    FOR q IN SELECT query_text FROM benchmark_queries ORDER BY random() LIMIT 50 LOOP
+        EXECUTE 'SELECT passage_id FROM msmarco_passages
+                 ORDER BY passage_text <@> to_bm25query($1, ''msmarco_bm25_idx'')
+                 LIMIT 10' USING q.query_text;
+    END LOOP;
+END;
+$$;
+
+-- ============================================================
+-- Benchmark 1: Query Latency by Token Count
+-- ============================================================
+\echo ''
+\echo '=== Benchmark 1: Query Latency by Token Count ==='
+\echo 'Running 100 queries per token bucket, reporting p50/p95/p99'
+\echo ''
+
+-- Temp table to capture per-bucket results for weighted average
+CREATE TEMP TABLE bucket_results (
+    bucket int,
+    p50_ms numeric, p95_ms numeric, p99_ms numeric,
+    avg_ms numeric, num_queries int, total_results bigint
+);
+
+-- Function to benchmark a bucket and return percentiles
+CREATE OR REPLACE FUNCTION benchmark_bucket(bucket int)
+RETURNS TABLE(p50_ms numeric, p95_ms numeric, p99_ms numeric, avg_ms numeric, num_queries int, total_results bigint) AS $$
+DECLARE
+    q record;
+    start_ts timestamp;
+    end_ts timestamp;
+    times numeric[];
+    sorted_times numeric[];
+    n int;
+    result_count bigint;
+    results_sum bigint := 0;
+BEGIN
+    -- The script-level statement_timeout caps a *single* outer
+    -- statement; inside this function's loop it would cap the cumulative
+    -- runtime of the whole bucket and abort partway through, throwing
+    -- away every per-query timing already collected. Disable it locally
+    -- so a slow-but-healthy bucket can finish; the workflow's
+    -- step-level timeout-minutes is the real backstop for hangs.
+    PERFORM set_config('statement_timeout', '0', true);
+
+    times := ARRAY[]::numeric[];
+
+    FOR q IN SELECT query_text FROM benchmark_queries WHERE token_bucket = bucket ORDER BY query_id LOOP
+        start_ts := clock_timestamp();
+        EXECUTE 'SELECT COUNT(*) FROM (SELECT passage_id FROM msmarco_passages
+                 ORDER BY passage_text <@> to_bm25query($1, ''msmarco_bm25_idx'')
+                 LIMIT 10) t' INTO result_count USING q.query_text;
+        end_ts := clock_timestamp();
+        times := array_append(times, EXTRACT(EPOCH FROM (end_ts - start_ts)) * 1000);
+        results_sum := results_sum + result_count;
+    END LOOP;
+
+    n := array_length(times, 1);
+    SELECT array_agg(t ORDER BY t) INTO sorted_times FROM unnest(times) t;
+
+    p50_ms := sorted_times[(n + 1) / 2];
+    p95_ms := sorted_times[(n * 95 + 99) / 100];
+    p99_ms := sorted_times[(n * 99 + 99) / 100];
+    avg_ms := (SELECT AVG(t) FROM unnest(times) t);
+    num_queries := n;
+    total_results := results_sum;
+    RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Run benchmarks for each token bucket (results saved for weighted avg)
+\echo 'Token bucket 1 (1 search token):'
+INSERT INTO bucket_results SELECT 1, * FROM benchmark_bucket(1);
+SELECT 'LATENCY_BUCKET_1: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 1;
+
+\echo ''
+\echo 'Token bucket 2 (2 search tokens):'
+INSERT INTO bucket_results SELECT 2, * FROM benchmark_bucket(2);
+SELECT 'LATENCY_BUCKET_2: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 2;
+
+\echo ''
+\echo 'Token bucket 3 (3 search tokens):'
+INSERT INTO bucket_results SELECT 3, * FROM benchmark_bucket(3);
+SELECT 'LATENCY_BUCKET_3: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 3;
+
+\echo ''
+\echo 'Token bucket 4 (4 search tokens):'
+INSERT INTO bucket_results SELECT 4, * FROM benchmark_bucket(4);
+SELECT 'LATENCY_BUCKET_4: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 4;
+
+\echo ''
+\echo 'Token bucket 5 (5 search tokens):'
+INSERT INTO bucket_results SELECT 5, * FROM benchmark_bucket(5);
+SELECT 'LATENCY_BUCKET_5: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 5;
+
+\echo ''
+\echo 'Token bucket 6 (6 search tokens):'
+INSERT INTO bucket_results SELECT 6, * FROM benchmark_bucket(6);
+SELECT 'LATENCY_BUCKET_6: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 6;
+
+\echo ''
+\echo 'Token bucket 7 (7 search tokens):'
+INSERT INTO bucket_results SELECT 7, * FROM benchmark_bucket(7);
+SELECT 'LATENCY_BUCKET_7: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 7;
+
+\echo ''
+\echo 'Token bucket 8 (8+ search tokens):'
+INSERT INTO bucket_results SELECT 8, * FROM benchmark_bucket(8);
+SELECT 'LATENCY_BUCKET_8: p50=' || round(p50_ms, 2) || 'ms p95=' || round(p95_ms, 2) || 'ms p99=' || round(p99_ms, 2) || 'ms avg=' || round(avg_ms, 2) || 'ms (n=' || num_queries || ', results=' || total_results || ')' as result
+FROM bucket_results WHERE bucket = 8;
+
+DROP FUNCTION benchmark_bucket;
+
+-- ============================================================
+-- Weighted-Average Query Latency (MS-MARCO v1 distribution)
+-- ============================================================
+-- Weights from observed lexeme distribution in 1,010,905 MS-MARCO
+-- v1 queries after to_tsvector: 1=3.5%, 2=16.3%, 3=30.2%,
+-- 4=26.1%, 5=14.2%, 6=5.9%, 7=2.2%, 8+=1.5%
+\echo ''
+\echo '=== Weighted-Average Query Latency & Throughput ==='
+SELECT 'WEIGHTED_LATENCY_RESULT: weighted_p50='
+    || round(SUM(b.p50_ms * w.weight) / SUM(w.weight), 2)
+    || 'ms weighted_avg='
+    || round(SUM(b.avg_ms * w.weight) / SUM(w.weight), 2)
+    || 'ms' as result
+FROM bucket_results b
+JOIN (VALUES
+    (1, 35638), (2, 165033), (3, 304887), (4, 264177),
+    (5, 143765), (6, 59558), (7, 22595), (8, 15252)
+) AS w(bucket, weight) ON b.bucket = w.bucket;
+
+SELECT 'WEIGHTED_THROUGHPUT_RESULT: '
+    || round(SUM(b.avg_ms * w.weight) / SUM(w.weight), 2)
+    || ' ms/query' as result
+FROM bucket_results b
+JOIN (VALUES
+    (1, 35638), (2, 165033), (3, 304887), (4, 264177),
+    (5, 143765), (6, 59558), (7, 22595), (8, 15252)
+) AS w(bucket, weight) ON b.bucket = w.bucket;
+
+DROP TABLE bucket_results;
+
+-- ============================================================
+-- Benchmark 2: Query Throughput (800 benchmark queries)
+-- ============================================================
+\echo ''
+\echo '=== Benchmark 2: Query Throughput (800 queries, 3 iterations) ==='
+\echo 'Running all 800 benchmark queries with warmup'
+
+-- Helper function for throughput benchmark
+CREATE OR REPLACE FUNCTION benchmark_throughput(iterations int DEFAULT 3)
+RETURNS TABLE(median_ms numeric, min_ms numeric, max_ms numeric, queries_run int) AS $$
+DECLARE
+    q record;
+    i int;
+    start_ts timestamp;
+    end_ts timestamp;
+    times numeric[];
+    sorted_times numeric[];
+    query_count int;
+BEGIN
+    -- Throughput runs ~3,200 sub-queries inside one outer SELECT
+    -- (800 warmup + 3 × 800 timed by default). The script-level
+    -- statement_timeout would cap that cumulative runtime, aborting the
+    -- benchmark before THROUGHPUT_RESULT is emitted — a regression
+    -- that's slow-but-healthy still loses all signal. Opt out locally;
+    -- the workflow's step-level timeout-minutes is the real backstop.
+    PERFORM set_config('statement_timeout', '0', true);
+
+    SELECT COUNT(*) INTO query_count FROM benchmark_queries;
+
+    -- Warmup: run all queries once
+    FOR q IN SELECT query_text FROM benchmark_queries ORDER BY query_id LOOP
+        EXECUTE 'SELECT passage_id FROM msmarco_passages
+                 ORDER BY passage_text <@> to_bm25query($1, ''msmarco_bm25_idx'')
+                 LIMIT 10' USING q.query_text;
+    END LOOP;
+
+    -- Timed iterations
+    times := ARRAY[]::numeric[];
+    FOR i IN 1..iterations LOOP
+        start_ts := clock_timestamp();
+        FOR q IN SELECT query_text FROM benchmark_queries ORDER BY query_id LOOP
+            EXECUTE 'SELECT passage_id FROM msmarco_passages
+                     ORDER BY passage_text <@> to_bm25query($1, ''msmarco_bm25_idx'')
+                     LIMIT 10' USING q.query_text;
+        END LOOP;
+        end_ts := clock_timestamp();
+        times := array_append(times, EXTRACT(EPOCH FROM (end_ts - start_ts)) * 1000);
+    END LOOP;
+
+    SELECT array_agg(t ORDER BY t) INTO sorted_times FROM unnest(times) t;
+    median_ms := sorted_times[(iterations + 1) / 2];
+    min_ms := sorted_times[1];
+    max_ms := sorted_times[iterations];
+    queries_run := query_count;
+    RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT 'Execution Time: ' || round(median_ms / queries_run, 3) || ' ms (min=' || round(min_ms / queries_run, 3) || ', max=' || round(max_ms / queries_run, 3) || ')' as result,
+       'THROUGHPUT_RESULT: ' || queries_run || ' queries in ' || round(median_ms, 2) || ' ms (avg ' || round(median_ms / queries_run, 2) || ' ms/query)' as summary
+FROM benchmark_throughput();
+
+DROP FUNCTION benchmark_throughput;
+
+-- ============================================================
+-- Benchmark 3: Index Statistics
+-- ============================================================
+\echo ''
+\echo '=== Benchmark 3: Index Statistics ==='
+
+SELECT
+    'msmarco_bm25_idx' as index_name,
+    pg_size_pretty(pg_relation_size('msmarco_bm25_idx')) as index_size,
+    pg_size_pretty(pg_relation_size('msmarco_passages')) as table_size,
+    (SELECT COUNT(*) FROM msmarco_passages) as num_documents;
+
+-- Cleanup
+DROP TABLE benchmark_queries;
+
+\echo ''
+\echo '=== MS MARCO Query Benchmarks Complete ==='

@@ -1,0 +1,298 @@
+#!/bin/bash
+# MS MARCO v2 Full Benchmark Runner
+# Runs pg_textsearch and ParadeDB benchmarks sequentially on 138M passages
+#
+# Prerequisites:
+#   - download.sh has been run (collection.tsv exists)
+#   - generate_benchmark_queries.sh has been run (benchmark_queries.tsv exists)
+#   - pg_textsearch is built and installed (make && sudo make install)
+#   - ParadeDB .deb is installed
+#
+# Usage: ./run_v2_benchmark.sh [step]
+#   Steps:
+#     all          - Run everything (default)
+#     load-tapir   - Load data + build pg_textsearch index
+#     query-tapir  - Run pg_textsearch query benchmarks
+#     load-paradedb - Load data + build ParadeDB index
+#     query-paradedb - Run ParadeDB query benchmarks
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+DATA_DIR="$SCRIPT_DIR/data"
+LOG_DIR="/tmp/msmarco-v2-benchmark"
+STEP="${1:-all}"
+
+# Postgres connection
+PGPORT="${PGPORT:-5432}"
+PGDATABASE="${PGDATABASE:-postgres}"
+
+export DATA_DIR PGPORT PGDATABASE
+
+mkdir -p "$LOG_DIR"
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+echo "=== MS MARCO v2 Benchmark ==="
+echo "Timestamp: $TIMESTAMP"
+echo "Step: $STEP"
+echo "Data dir: $DATA_DIR"
+echo "PG port: $PGPORT"
+echo "Log dir: $LOG_DIR"
+echo ""
+
+# Verify prerequisites
+check_prereqs() {
+    if [ ! -f "$DATA_DIR/collection.tsv" ]; then
+        echo "ERROR: collection.tsv not found. Run ./download.sh first."
+        exit 1
+    fi
+    if [ ! -f "$SCRIPT_DIR/benchmark_queries.tsv" ]; then
+        echo "ERROR: benchmark_queries.tsv not found. Run ./generate_benchmark_queries.sh first."
+        exit 1
+    fi
+    echo "Prerequisites OK"
+    echo "  Collection: $(wc -l < "$DATA_DIR/collection.tsv") passages"
+    echo "  Benchmark queries: $(wc -l < "$SCRIPT_DIR/benchmark_queries.tsv") queries"
+    echo ""
+}
+
+# Verify pg_textsearch version
+check_tapir_version() {
+    local ver
+    ver=$(psql -t -c "SELECT default_version FROM pg_available_extensions WHERE name = 'pg_textsearch';" 2>/dev/null | tr -d ' ')
+    echo "pg_textsearch version: $ver"
+    if [ "$ver" != "1.4.0-dev" ]; then
+        echo "WARNING: Expected 1.4.0-dev, got '$ver'"
+    fi
+}
+
+# Show system info
+show_system_info() {
+    echo "=== System Info ==="
+    echo "CPU: $(nproc) cores"
+    echo "RAM: $(free -h | awk '/^Mem:/{print $2}')"
+    echo "Disk (NVMe): $(df -h /nvme | tail -1 | awk '{print $4 " avail of " $2}')"
+    echo "PG data dir: $(psql -t -c 'SHOW data_directory;' | tr -d ' ')"
+    echo "PG version: $(psql -t -c 'SELECT version();' | head -1)"
+    echo ""
+}
+
+load_tapir() {
+    echo "=== Loading pg_textsearch (Tapir) ==="
+    local log="$LOG_DIR/tapir_load_${TIMESTAMP}.log"
+    echo "Log: $log"
+
+    check_tapir_version
+
+    # Use max parallelism for index build
+    local ncpu
+    ncpu=$(nproc)
+    local workers=$((ncpu - 2))
+    if [ "$workers" -lt 2 ]; then
+        workers=2
+    fi
+    echo "Using $workers parallel maintenance workers"
+
+    psql -v ON_ERROR_STOP=1 <<EOSQL 2>&1 | tee "$log"
+\timing on
+
+-- Ensure extension is loaded
+CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+
+-- Max out parallelism for this session
+SET max_parallel_maintenance_workers = $workers;
+SET maintenance_work_mem = '8GB';
+
+-- Verify data is loaded
+\echo '=== Data Verification ==='
+SELECT 'Passages:' as what, COUNT(*)::text as n FROM msmarco_v2_passages
+UNION ALL SELECT 'Queries:', COUNT(*)::text FROM msmarco_v2_queries
+UNION ALL SELECT 'Qrels:', COUNT(*)::text FROM msmarco_v2_qrels
+ORDER BY what;
+
+-- Drop existing BM25 index if present, then rebuild
+DROP INDEX IF EXISTS msmarco_v2_bm25_idx;
+
+\echo ''
+\echo '=== Building BM25 Index (parallel workers: $workers) ==='
+CREATE INDEX msmarco_v2_bm25_idx ON msmarco_v2_passages
+    USING bm25(passage_text) WITH (text_config='english');
+
+-- Report sizes
+\echo ''
+\echo '=== Sizes ==='
+SELECT 'INDEX_SIZE:' as label,
+    pg_size_pretty(pg_relation_size('msmarco_v2_bm25_idx')) as size,
+    pg_relation_size('msmarco_v2_bm25_idx') as bytes;
+SELECT 'TABLE_SIZE:' as label,
+    pg_size_pretty(pg_total_relation_size('msmarco_v2_passages')) as size,
+    pg_total_relation_size('msmarco_v2_passages') as bytes;
+
+\echo ''
+\echo '=== Segment Statistics ==='
+SELECT bm25_summarize_index('msmarco_v2_bm25_idx');
+
+\echo '=== pg_textsearch Load Complete ==='
+EOSQL
+
+    echo ""
+    echo "Load log: $log"
+}
+
+load_tapir_index_only() {
+    echo "=== Building pg_textsearch Index Only ==="
+    local log="$LOG_DIR/tapir_index_${TIMESTAMP}.log"
+    echo "Log: $log"
+
+    check_tapir_version
+
+    local ncpu
+    ncpu=$(nproc)
+    local workers=$((ncpu - 2))
+    if [ "$workers" -lt 2 ]; then
+        workers=2
+    fi
+    echo "Using $workers parallel maintenance workers"
+
+    psql -v ON_ERROR_STOP=1 <<EOSQL 2>&1 | tee "$log"
+\timing on
+
+SET max_parallel_maintenance_workers = $workers;
+SET maintenance_work_mem = '8GB';
+
+-- Drop old index if exists
+DROP INDEX IF EXISTS msmarco_v2_bm25_idx;
+
+\echo '=== Building BM25 Index (parallel workers: $workers) ==='
+CREATE INDEX msmarco_v2_bm25_idx ON msmarco_v2_passages
+    USING bm25(passage_text) WITH (text_config='english');
+
+\echo ''
+\echo '=== Sizes ==='
+SELECT 'INDEX_SIZE:' as label,
+    pg_size_pretty(pg_relation_size('msmarco_v2_bm25_idx')) as size,
+    pg_relation_size('msmarco_v2_bm25_idx') as bytes;
+SELECT 'TABLE_SIZE:' as label,
+    pg_size_pretty(pg_total_relation_size('msmarco_v2_passages')) as size,
+    pg_total_relation_size('msmarco_v2_passages') as bytes;
+
+\echo ''
+\echo '=== Segment Statistics ==='
+SELECT bm25_summarize_index('msmarco_v2_bm25_idx');
+
+\echo '=== Index Build Complete ==='
+EOSQL
+
+    echo ""
+    echo "Index build log: $log"
+}
+
+query_tapir() {
+    echo "=== Running pg_textsearch Query Benchmarks ==="
+    local log="$LOG_DIR/tapir_queries_${TIMESTAMP}.log"
+    echo "Log: $log"
+
+    cd "$REPO_DIR"
+    psql -f benchmarks/datasets/msmarco-v2/queries.sql 2>&1 | tee "$log"
+
+    echo ""
+    echo "Query log: $log"
+    echo ""
+    echo "=== Key Results ==="
+    grep -E "LATENCY_BUCKET|THROUGHPUT_RESULT|INDEX_SIZE" "$log" || true
+}
+
+load_paradedb() {
+    echo "=== Loading ParadeDB (ParadeDB) ==="
+    local log="$LOG_DIR/paradedb_load_${TIMESTAMP}.log"
+    echo "Log: $log"
+
+    # Drop pg_textsearch first to avoid conflicts
+    psql -c "DROP EXTENSION IF EXISTS pg_textsearch CASCADE;" 2>/dev/null || true
+
+    cd "$REPO_DIR"
+    psql -f benchmarks/datasets/msmarco-v2/paradedb/load.sql 2>&1 | tee "$log"
+
+    echo ""
+    echo "Load log: $log"
+}
+
+query_paradedb() {
+    echo "=== Running ParadeDB Query Benchmarks ==="
+    local log="$LOG_DIR/paradedb_queries_${TIMESTAMP}.log"
+    echo "Log: $log"
+
+    cd "$REPO_DIR"
+    psql -f benchmarks/datasets/msmarco-v2/paradedb/queries.sql 2>&1 | tee "$log"
+
+    echo ""
+    echo "Query log: $log"
+    echo ""
+    echo "=== Key Results ==="
+    grep -E "LATENCY_BUCKET|THROUGHPUT_RESULT|INDEX_SIZE" "$log" || true
+}
+
+cleanup_tapir() {
+    echo "=== Cleaning up pg_textsearch data ==="
+    psql -c "DROP TABLE IF EXISTS msmarco_v2_passages CASCADE;"
+    psql -c "DROP TABLE IF EXISTS msmarco_v2_queries CASCADE;"
+    psql -c "DROP TABLE IF EXISTS msmarco_v2_qrels CASCADE;"
+    psql -c "DROP EXTENSION IF EXISTS pg_textsearch CASCADE;"
+    echo "Cleanup complete"
+}
+
+cleanup_paradedb() {
+    echo "=== Cleaning up ParadeDB data ==="
+    psql -c "DROP TABLE IF EXISTS msmarco_v2_passages_paradedb CASCADE;"
+    psql -c "DROP TABLE IF EXISTS msmarco_v2_queries_paradedb CASCADE;"
+    psql -c "DROP TABLE IF EXISTS msmarco_v2_qrels_paradedb CASCADE;"
+    psql -c "DROP EXTENSION IF EXISTS pg_search CASCADE;"
+    echo "Cleanup complete"
+}
+
+# Main
+check_prereqs
+show_system_info
+
+case "$STEP" in
+    all)
+        load_tapir
+        query_tapir
+        cleanup_tapir
+        load_paradedb
+        query_paradedb
+        cleanup_paradedb
+        ;;
+    load-tapir)
+        load_tapir
+        ;;
+    index-tapir)
+        load_tapir_index_only
+        ;;
+    query-tapir)
+        query_tapir
+        ;;
+    load-paradedb)
+        load_paradedb
+        ;;
+    query-paradedb)
+        query_paradedb
+        ;;
+    cleanup-tapir)
+        cleanup_tapir
+        ;;
+    cleanup-paradedb)
+        cleanup_paradedb
+        ;;
+    *)
+        echo "Unknown step: $STEP"
+        echo "Valid steps: all, load-tapir, index-tapir, query-tapir, load-paradedb, query-paradedb, cleanup-tapir, cleanup-paradedb"
+        exit 1
+        ;;
+esac
+
+echo ""
+echo "=== Done ==="
+echo "Logs in: $LOG_DIR"

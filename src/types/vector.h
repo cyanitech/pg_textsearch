@@ -1,0 +1,167 @@
+/*
+ * Copyright (c) 2025-2026 Tiger Data, Inc.
+ * Licensed under the PostgreSQL License. See LICENSE for details.
+ *
+ * vector.h - bm25vector data type interface
+ *
+ * Wire / on-disk format (v2, introduced in pg_textsearch 1.2.0).
+ *
+ * Each value carries a 4-byte ASCII magic ("BM25") immediately
+ * after the varlena header, then a 1-byte version + 3 reserved
+ * bytes, then the index_name and entries payload. Per-entry data
+ * is variable-length (varint freq + varint lexeme_len + raw
+ * lexeme bytes); typical entries are ~8 bytes for an English
+ * stemmed lexeme with frequency 1.
+ *
+ * v2 layout:
+ *   int32 vl_len_, char magic[4], uint8 version, uint8 reserved[3],
+ *   int32 index_name_len, int32 entry_count, data...
+ *   per-entry (variable-length, no padding):
+ *     varint frequency       (1 byte for freq <= 127)
+ *     varint lexeme_len      (1 byte for lex_len <= 127)
+ *     char lexeme[lexeme_len]
+ *
+ * Legacy (pre-1.2.0) values use a different layout. They are
+ * detected via the absence of the v2 magic and rejected by
+ * tpvector_canonicalize() with a clear REINDEX-or-recompute
+ * error, rather than silently misinterpreted. bm25vector values
+ * are almost always transient — the storage path through user
+ * tables was uncommon — so the cost of converting legacy values
+ * isn't worth carrying. Users with persisted v1 data must
+ * recompute via to_bm25vector() from the source text.
+ *
+ * Internal code only ever sees validated v2 values: operator
+ * entry points (tpvector_recv, tpvector_eq, tpvector_send,
+ * tpvector_out) canonicalize at the boundary, which both checks
+ * the magic and bounds-validates the entry stream.
+ *
+ * Entry access pattern: entries are byte streams, so the legacy
+ * `entry->frequency` / `entry->lexeme_len` / `entry->lexeme` field
+ * accesses are no longer possible. Use TpVectorEntryView (a decoded
+ * snapshot) and the iterator helpers below.
+ */
+#pragma once
+
+#include <postgres.h>
+
+#include <fmgr.h>
+
+/* v2 format constants */
+#define TPVECTOR_V2_MAGIC0 'B'
+#define TPVECTOR_V2_MAGIC1 'M'
+#define TPVECTOR_V2_MAGIC2 '2'
+#define TPVECTOR_V2_MAGIC3 '5'
+#define TPVECTOR_VERSION   2
+
+/*
+ * Opaque entry handle. v2 entries are variable-length byte
+ * sequences; field access goes through tpvector_entry_decode().
+ */
+typedef struct TpVectorEntry TpVectorEntry;
+
+/*
+ * Decoded snapshot of a single entry. Fields are normal C types,
+ * `lexeme` points into the underlying TpVector buffer (not
+ * separately allocated; do not free).
+ */
+typedef struct TpVectorEntryView
+{
+	uint32		frequency;
+	uint32		lexeme_len;
+	const char *lexeme;
+} TpVectorEntryView;
+
+/* tpvector data type structure (v2 layout) */
+typedef struct TpVector
+{
+	int32 vl_len_;					   /* varlena header (must be first) */
+	char  magic[4];					   /* "BM25" — discriminates v2 from v1 */
+	uint8 version;					   /* TPVECTOR_VERSION (2) */
+	uint8 reserved[3];				   /* zero; future flags / format bits */
+	int32 index_name_len;			   /* length of index name */
+	int32 entry_count;				   /* number of term/frequency pairs */
+	char  data[FLEXIBLE_ARRAY_MEMBER]; /* payload: index name + entries */
+} TpVector;
+
+/* Macros for accessing tpvector variable-length data (v2). */
+#define TPVECTOR_INDEX_NAME_PTR(x) (((TpVector *)(x))->data)
+#define TPVECTOR_ENTRIES_PTR(x)                  \
+	((TpVectorEntry *)(((TpVector *)(x))->data + \
+					   MAXALIGN(((TpVector *)(x))->index_name_len + 1)))
+
+/* Function declarations */
+Datum tpvector_in(PG_FUNCTION_ARGS);
+Datum tpvector_out(PG_FUNCTION_ARGS);
+Datum tpvector_recv(PG_FUNCTION_ARGS);
+Datum tpvector_send(PG_FUNCTION_ARGS);
+Datum to_tpvector(PG_FUNCTION_ARGS);
+Datum tpvector_eq(PG_FUNCTION_ARGS);
+
+/* Constructor */
+TpVector *create_tpvector_from_strings(
+		const char	*index_name,
+		int			 entry_count,
+		const char **lexemes,
+		const int32 *frequencies);
+
+char *get_tpvector_index_name(TpVector *tpvec);
+
+/*
+ * Entry iteration. Pattern:
+ *
+ *   TpVectorEntry *e = get_tpvector_first_entry(vec);
+ *   for (int i = 0; i < vec->entry_count; i++) {
+ *       TpVectorEntryView v;
+ *       e = tpvector_entry_decode_advance(e, &v);
+ *       // use v.frequency, v.lexeme_len, v.lexeme
+ *   }
+ *
+ * The decode-only / advance-only variants are kept for callers
+ * that need either operation independently (e.g. validators);
+ * the hot path should use the combined `_advance` form, which
+ * decodes the varints exactly once.
+ */
+TpVectorEntry *get_tpvector_first_entry(TpVector *vec);
+TpVectorEntry *get_tpvector_next_entry(TpVectorEntry *current);
+void tpvector_entry_decode(const TpVectorEntry *entry, TpVectorEntryView *out);
+TpVectorEntry *tpvector_entry_decode_advance(
+		const TpVectorEntry *entry, TpVectorEntryView *out);
+
+/*
+ * Format detection + canonicalization.
+ *
+ * tpvector_is_v2(raw) returns true if `raw` carries the v2 magic.
+ * tpvector_canonicalize(raw) returns a v2 TpVector — either `raw`
+ *   itself if already v2, or a freshly palloc'd v2 copy converted
+ *   from v1.
+ */
+bool	  tpvector_is_v2(const void *raw);
+TpVector *tpvector_canonicalize(TpVector *raw);
+
+/*
+ * Full validation of a raw byte buffer as a v2 TpVector.
+ *
+ * Checks that `len` is large enough to cover the TpVector header,
+ * that the magic and version bytes match, that the embedded
+ * varlena length equals `len`, and that the entry stream decodes
+ * fully within the buffer (each varint freq + varint lexeme_len +
+ * lexeme bytes stays in bounds).  On any inconsistency, raises an
+ * ereport(ERROR, errcode=ERRCODE_DATA_CORRUPTED).
+ *
+ * After a successful call the buffer is safe to iterate with
+ * get_tpvector_first_entry / get_tpvector_next_entry without per-
+ * entry bounds checks.  Use this at trust boundaries where the
+ * bytes come from on-disk memtable pages, network input, or other
+ * untrusted sources.
+ */
+void tpvector_validate_v2_buffer(const char *bytes, uint32 len);
+
+/*
+ * Varint helpers (internal but exposed for adjacent code).
+ *
+ * Encoding: little-endian base-128. Each byte's high bit indicates
+ * whether more bytes follow. Values 0..127 take 1 byte.
+ */
+uint32 tpvector_varint_decode(const uint8 **cursor, const uint8 *end);
+size_t tpvector_varint_encode(uint32 v, uint8 *out);
+size_t tpvector_varint_size(uint32 v);

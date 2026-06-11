@@ -1,0 +1,61 @@
+-- Test bulk insert with auto-spill for pg_textsearch indexes
+
+-- Create extension if not exists
+CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+
+-- Create test table
+DROP TABLE IF EXISTS memory_test CASCADE;
+CREATE TABLE memory_test (id serial PRIMARY KEY, content text);
+
+-- Suppress auto-spill NOTICE messages during test to avoid non-deterministic output
+-- (The exact DSA memory values vary between runs)
+SET client_min_messages = WARNING;
+
+-- Create an index
+CREATE INDEX idx_memory_test
+ON memory_test
+USING bm25(content)
+WITH (text_config='english');
+
+-- Insert some documents
+INSERT INTO memory_test (content)
+VALUES ('This is a test document with some content');
+
+INSERT INTO memory_test (content)
+VALUES ('Another document with different words');
+
+-- Insert many documents with lots of unique terms to exercise auto-spill.
+-- With 1000 docs * 100 unique terms = 100K terms per transaction,
+-- this should trigger the bulk_load_threshold (default 100K).
+DO $$
+DECLARE
+    i integer;
+    doc text;
+BEGIN
+    FOR i IN 1..1000 LOOP
+        -- Generate document with unique terms to increase memory usage
+        doc := 'Document number ' || i || ' with unique terms: ';
+        -- Add lots of unique words per document
+        FOR j IN 1..100 LOOP
+            doc := doc || ' term_' || i || '_' || j;
+        END LOOP;
+
+        INSERT INTO memory_test (content) VALUES (doc);
+    END LOOP;
+END $$;
+
+-- Re-enable notices for verification output
+RESET client_min_messages;
+
+-- Verify that all documents were inserted and index works
+SELECT COUNT(*) AS total_docs FROM memory_test;
+
+-- Search should find documents
+SELECT id, left(content, 50) AS content_preview
+FROM memory_test
+ORDER BY content <@> 'test'
+LIMIT 5;
+
+-- Clean up
+DROP TABLE memory_test CASCADE;
+DROP EXTENSION pg_textsearch CASCADE;

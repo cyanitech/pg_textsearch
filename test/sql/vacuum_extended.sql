@@ -1,0 +1,436 @@
+-- Extended vacuum tests for BM25 indexes
+-- Exercises vacuum paths with segments, bulk deletes, and empty indexes
+
+CREATE EXTENSION IF NOT EXISTS pg_textsearch;
+
+-- =============================================================================
+-- Test 1: Vacuum with segments present
+-- =============================================================================
+
+CREATE TABLE vacuum_seg_test (id serial PRIMARY KEY, content text);
+CREATE INDEX vacuum_seg_idx ON vacuum_seg_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Insert data and force segment creation
+INSERT INTO vacuum_seg_test (content)
+SELECT 'vacuum segment test document number ' || i
+FROM generate_series(1, 200) AS i;
+
+SELECT bm25_spill_index('vacuum_seg_idx');
+
+-- Delete half the documents
+DELETE FROM vacuum_seg_test WHERE id <= 100;
+
+-- VACUUM with segments on disk
+VACUUM vacuum_seg_test;
+
+-- Verify search still works after vacuum with segments
+SELECT count(*) FROM (
+    SELECT 1 FROM vacuum_seg_test
+    ORDER BY content <@> to_bm25query('vacuum', 'vacuum_seg_idx')
+) sub;
+
+-- =============================================================================
+-- Test 2: VACUUM FULL with segments (forces index rebuild)
+-- =============================================================================
+
+\set VERBOSITY terse
+VACUUM FULL vacuum_seg_test;
+\set VERBOSITY default
+
+-- Verify search works after VACUUM FULL rebuild
+SELECT count(*) FROM (
+    SELECT 1 FROM vacuum_seg_test
+    ORDER BY content <@> to_bm25query('vacuum', 'vacuum_seg_idx')
+) sub;
+
+DROP TABLE vacuum_seg_test;
+
+-- =============================================================================
+-- Test 3: Vacuum on empty index
+-- =============================================================================
+
+CREATE TABLE vacuum_empty_test (id serial PRIMARY KEY, content text);
+CREATE INDEX vacuum_empty_idx ON vacuum_empty_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Vacuum empty index (should be a no-op)
+VACUUM vacuum_empty_test;
+
+-- Insert one doc, delete it, vacuum
+INSERT INTO vacuum_empty_test (content) VALUES ('single document');
+DELETE FROM vacuum_empty_test;
+VACUUM vacuum_empty_test;
+
+DROP TABLE vacuum_empty_test;
+
+-- =============================================================================
+-- Test 4: Bulk delete from memtable (exercises tp_bulkdelete_memtable_ctids)
+-- =============================================================================
+
+CREATE TABLE vacuum_bulk_test (id serial PRIMARY KEY, content text);
+CREATE INDEX vacuum_bulk_idx ON vacuum_bulk_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Insert docs (stays in memtable)
+INSERT INTO vacuum_bulk_test (content)
+SELECT 'bulk delete test term' || (i % 10) || ' document ' || i
+FROM generate_series(1, 50) AS i;
+
+-- Delete most of them
+DELETE FROM vacuum_bulk_test WHERE id > 5;
+
+-- Vacuum to clean up memtable entries
+VACUUM vacuum_bulk_test;
+
+-- Verify remaining docs are searchable
+SELECT count(*) FROM (
+    SELECT 1 FROM vacuum_bulk_test
+    ORDER BY content <@> to_bm25query('bulk', 'vacuum_bulk_idx')
+) sub;
+
+DROP TABLE vacuum_bulk_test;
+
+-- =============================================================================
+-- Test 5: REINDEX with unflushed memtable data
+--
+-- Verifies that REINDEX correctly rebuilds from the heap even when
+-- the memtable has unflushed entries from recent INSERTs.
+-- =============================================================================
+
+CREATE TABLE reindex_memtable_test (
+    id serial PRIMARY KEY,
+    content text
+);
+CREATE INDEX reindex_memtable_idx
+    ON reindex_memtable_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Phase 1: Initial data via CREATE INDEX (already built above)
+INSERT INTO reindex_memtable_test (content)
+SELECT 'original document about databases number ' || i
+FROM generate_series(1, 50) AS i;
+
+-- Force a spill so we have segments on disk
+SELECT bm25_spill_index('reindex_memtable_idx');
+
+-- Verify baseline: all 50 docs are searchable
+SELECT count(*) AS pre_reindex_count FROM (
+    SELECT 1 FROM reindex_memtable_test
+    ORDER BY content <@> to_bm25query('databases', 'reindex_memtable_idx')
+) sub;
+
+-- Phase 2: Insert more rows that stay in memtable (unflushed)
+INSERT INTO reindex_memtable_test (content)
+SELECT 'additional document about databases number ' || i
+FROM generate_series(51, 75) AS i;
+
+-- Verify memtable scan finds all 75 docs
+SELECT count(*) AS with_memtable_count FROM (
+    SELECT 1 FROM reindex_memtable_test
+    ORDER BY content <@> to_bm25query('databases', 'reindex_memtable_idx')
+) sub;
+
+-- Phase 3: REINDEX discards memtable, rebuilds from heap
+\set VERBOSITY terse
+REINDEX INDEX reindex_memtable_idx;
+\set VERBOSITY default
+
+-- All 75 docs must still be found (rebuilt from heap, not memtable)
+SELECT count(*) AS post_reindex_count FROM (
+    SELECT 1 FROM reindex_memtable_test
+    ORDER BY content <@> to_bm25query('databases', 'reindex_memtable_idx')
+) sub;
+
+-- Phase 4: Verify INSERTs still work after REINDEX
+INSERT INTO reindex_memtable_test (content)
+VALUES ('final document about databases after reindex');
+
+SELECT count(*) AS final_count FROM (
+    SELECT 1 FROM reindex_memtable_test
+    ORDER BY content <@> to_bm25query('databases', 'reindex_memtable_idx')
+) sub;
+
+DROP TABLE reindex_memtable_test;
+
+-- =============================================================================
+-- Test 6: Bulk load with unflushed memtable data
+--
+-- Verifies that a large INSERT into an already-indexed table correctly
+-- triggers auto-spills from the memtable while preserving earlier
+-- unflushed memtable entries.  Uses a low spill threshold so the test
+-- triggers multiple spills without needing millions of rows.
+-- =============================================================================
+
+-- Lower spill threshold BEFORE creating the table so it applies to inserts
+SET pg_textsearch.memtable_pages_threshold = 1;
+
+CREATE TABLE bulk_memtable_test (
+    id serial PRIMARY KEY,
+    content text
+);
+CREATE INDEX bulk_memtable_idx
+    ON bulk_memtable_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Phase 1: Small insert that stays in memtable
+INSERT INTO bulk_memtable_test (content)
+SELECT 'initial document about networking topic ' || i
+FROM generate_series(1, 10) AS i;
+
+SELECT count(*) AS initial_count FROM (
+    SELECT 1 FROM bulk_memtable_test
+    ORDER BY content <@> to_bm25query('networking', 'bulk_memtable_idx')
+) sub;
+
+-- Phase 2: Bulk insert triggers multiple auto-spills
+INSERT INTO bulk_memtable_test (content)
+SELECT 'bulk loaded document about networking and databases number ' || i
+FROM generate_series(11, 5000) AS i;
+
+-- All 5000 docs must be found (initial memtable + spilled segments + tail)
+SELECT count(*) AS after_bulk_count FROM (
+    SELECT 1 FROM bulk_memtable_test
+    ORDER BY content <@> to_bm25query('networking', 'bulk_memtable_idx')
+) sub;
+
+-- Verify segments were created by the auto-spill
+SELECT bm25_summarize_index('bulk_memtable_idx') ~ 'Total:.*segments'
+    AS has_segments;
+
+-- Phase 3: More inserts after bulk load still work
+INSERT INTO bulk_memtable_test (content)
+VALUES ('final document about networking after bulk load');
+
+SELECT count(*) AS final_count FROM (
+    SELECT 1 FROM bulk_memtable_test
+    ORDER BY content <@> to_bm25query('networking', 'bulk_memtable_idx')
+) sub;
+
+RESET pg_textsearch.memtable_pages_threshold;
+DROP TABLE bulk_memtable_test;
+
+-- =============================================================================
+-- Test 7: VACUUM spills un-spilled memtable on insert-only tables (issue #333)
+--
+-- On insert-only workloads ambulkdelete is skipped (no dead tuples), so the
+-- memtable spill that used to live only there never ran.  The memtable
+-- chain pages then grew unbounded and queries had to walk the entire
+-- chain.  This test exercises the amvacuumcleanup path that now performs
+-- the spill.
+-- =============================================================================
+
+CREATE TABLE vacuum_insert_only_test (
+    id serial PRIMARY KEY,
+    content text
+);
+CREATE INDEX vacuum_insert_only_idx
+    ON vacuum_insert_only_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Populate the memtable chain above TP_MIN_SPILL_POSTINGS (1000) but
+-- below pg_textsearch.bulk_load_threshold so the spill only happens
+-- via amvacuumcleanup.  2000 docs * ~4 terms each ≈ 8000 postings.
+INSERT INTO vacuum_insert_only_test (content)
+SELECT 'insert only document number ' || i
+FROM generate_series(1, 2000) AS i;
+
+-- Chain should be populated before VACUUM.
+SELECT count(*) > 0 AS chain_populated_before_vacuum
+FROM bm25_memtable_chain('vacuum_insert_only_idx');
+
+-- No dead tuples here, so ambulkdelete is not invoked; only
+-- amvacuumcleanup runs.  It must still drain the memtable chain.
+VACUUM vacuum_insert_only_test;
+
+-- Chain must be fully drained and the memtable contents spilled to a segment.
+SELECT count(*) = 0 AS chain_empty_after_vacuum
+FROM bm25_memtable_chain('vacuum_insert_only_idx');
+
+-- Search still finds all 2000 docs.
+SELECT count(*) AS post_vacuum_count FROM (
+    SELECT 1 FROM vacuum_insert_only_test
+    ORDER BY content
+        <@> to_bm25query('document', 'vacuum_insert_only_idx')
+) sub;
+
+DROP TABLE vacuum_insert_only_test;
+
+-- =============================================================================
+-- Test 8: tiny memtable stays un-spilled across VACUUM (issue #333 guard)
+-- =============================================================================
+--
+-- Below TP_MIN_SPILL_POSTINGS the VACUUM-cleanup spill is a no-op,
+-- because writing a runt L0 segment would cost more in subsequent
+-- compaction than chain replay saves.
+
+CREATE TABLE vacuum_tiny_test (id serial PRIMARY KEY, content text);
+CREATE INDEX vacuum_tiny_idx
+    ON vacuum_tiny_test USING bm25(content)
+    WITH (text_config='english');
+
+-- ~50 docs * ~4 terms = ~200 postings, well below the guard.
+INSERT INTO vacuum_tiny_test (content)
+SELECT 'tiny doc ' || i FROM generate_series(1, 50) AS i;
+
+VACUUM vacuum_tiny_test;
+
+-- Chain is still present; no runt L0 segment was produced.
+SELECT count(*) > 0 AS chain_preserved_after_vacuum
+FROM bm25_memtable_chain('vacuum_tiny_idx');
+
+DROP TABLE vacuum_tiny_test;
+
+-- =============================================================================
+-- Test 9: dropping a memtable-spilled L0 segment keeps total_len sane
+-- =============================================================================
+--
+-- Regression test.  tp_write_segment used to leave header.total_tokens
+-- at the cumulative shared-atomic value instead of the per-segment
+-- sum.  When VACUUM later dropped that segment (all docs dead) the
+-- inflated header.total_tokens was subtracted from metap->total_len
+-- and the atomic, clamping them to 0 (or wrapping the atomic) and
+-- breaking avgdl in BM25 scoring for the surviving docs.
+--
+-- We populate two L0 segments with distinct id ranges, delete every
+-- row that landed in the second one, and then run VACUUM.  Afterwards
+-- a search over the surviving corpus must return real matches.
+
+CREATE TABLE l0_total_len_test (id serial PRIMARY KEY, content text);
+CREATE INDEX l0_total_len_idx ON l0_total_len_test USING bm25(content)
+    WITH (text_config='english');
+
+-- Segment 1: ids 1..50 (the survivors).
+INSERT INTO l0_total_len_test (content)
+SELECT 'alpha common term doc ' || i FROM generate_series(1, 50) AS i;
+SELECT bm25_spill_index('l0_total_len_idx');
+
+-- Segment 2: ids 51..100 (to be fully deleted).
+INSERT INTO l0_total_len_test (content)
+SELECT 'beta common term doc ' || i FROM generate_series(51, 100) AS i;
+SELECT bm25_spill_index('l0_total_len_idx');
+
+-- Wipe every row that went into segment 2, then VACUUM to drop it.
+DELETE FROM l0_total_len_test WHERE id > 50;
+VACUUM l0_total_len_test;
+
+-- total_len must reflect only the surviving segment's tokens.  The
+-- pre-fix path inflated header.total_tokens to the cumulative atomic
+-- so the subtraction clamped total_len to 0.  A healthy avg_doc_len
+-- is the sharpest regression signal.
+SELECT bm25_summarize_index('l0_total_len_idx') ~ E'total_len: 250\n'
+    AS total_len_matches_survivors,
+       bm25_summarize_index('l0_total_len_idx') ~ E'avg_doc_len: 5\\.00\n'
+    AS avgdl_sane;
+
+DROP TABLE l0_total_len_test;
+
+-- =============================================================================
+-- Test 10: merged segments carry raw total_tokens (long docs + VACUUM)
+-- =============================================================================
+--
+-- Regression test.  merge.c used to recompute header.total_tokens as
+-- Σ decode_fieldnorm(fieldnorms[d]), which is exponentially quantized
+-- for doc_length > 39 (e.g. 100→96).  metap->total_len stayed raw
+-- (set from the atomic), so the drift was latent until a VACUUM drop
+-- of the merged segment fed the quantized header value back into
+-- metap via tp_apply_vacuum_shrinkage, leaving phantom tokens.
+--
+-- Fix: merge starts from Σ source.header.total_tokens (raw) minus a
+-- dead-only fieldnorm approximation.  For all-live sources the merged
+-- total_tokens is exact, so the VACUUM subtraction cancels to zero.
+
+SET pg_textsearch.segments_per_level = 2;
+
+CREATE TABLE merge_long_docs (id serial PRIMARY KEY, content text);
+CREATE INDEX merge_long_idx ON merge_long_docs USING bm25(content)
+    WITH (text_config='english');
+
+-- Each doc has 100 unique tokens.  decode(encode(100)) = 96.
+INSERT INTO merge_long_docs (content)
+SELECT string_agg('term' || (j + i*1000), ' ')
+FROM generate_series(1, 30) i,
+     generate_series(1, 100) j
+GROUP BY i;
+SELECT bm25_spill_index('merge_long_idx');
+
+INSERT INTO merge_long_docs (content)
+SELECT string_agg('other' || (j + i*1000), ' ')
+FROM generate_series(1, 30) i,
+     generate_series(1, 100) j
+GROUP BY i;
+SELECT bm25_spill_index('merge_long_idx');
+
+-- Sanity: both batches merged into a single L1 segment.
+SELECT bm25_summarize_index('merge_long_idx') ~ E'L1 Segment'
+    AS has_l1_segment;
+
+-- Delete every row so VACUUM drops the merged segment.  With the fix
+-- the L1 header carries raw 6000 tokens; subtracting that from the
+-- atomic/metapage total_len (also 6000) leaves 0.  Pre-fix the L1
+-- header was 60 × 96 = 5760 (quantized), leaving 240 phantom tokens
+-- that would bias avg_doc_len for any surviving docs and persist
+-- across the next tp_sync_metapage_stats.
+DELETE FROM merge_long_docs;
+VACUUM merge_long_docs;
+
+SELECT bm25_summarize_index('merge_long_idx') ~ E'total_len: 0\n'
+    AS total_len_zero_after_drop,
+       bm25_summarize_index('merge_long_idx') ~ E'total_docs: 0\n'
+    AS total_docs_zero_after_drop;
+
+RESET pg_textsearch.segments_per_level;
+DROP TABLE merge_long_docs;
+
+-- =============================================================================
+-- Test 11: merge drops V5-bitset-dead docs and applies shrinkage
+-- =============================================================================
+--
+-- Regression test.  tp_merge_level_segments used to update
+-- level_heads/level_counts but leave metap->total_docs / total_len
+-- at the pre-merge value when the merged segment dropped docs that
+-- VACUUM had previously marked dead in the source bitsets.  After
+-- the merge, Σ segment.num_docs (= live count) was strictly less
+-- than metap->total_docs, violating the primary invariant.
+--
+-- Setup: two L0 spills below segments_per_level so no compaction
+-- fires yet, VACUUM to flip dead bits, then a third spill that
+-- triggers an L0→L1 compaction.  The merged L1 segment excludes the
+-- dead docs; metap must shrink to match.
+
+SET pg_textsearch.segments_per_level = 3;
+
+CREATE TABLE merge_drop_dead (id serial PRIMARY KEY, content text);
+CREATE INDEX merge_drop_idx ON merge_drop_dead USING bm25(content)
+    WITH (text_config='english');
+
+-- Spills 1 and 2.
+INSERT INTO merge_drop_dead (content)
+SELECT 'one alpha common term doc ' || i FROM generate_series(1, 30) AS i;
+SELECT bm25_spill_index('merge_drop_idx');
+
+INSERT INTO merge_drop_dead (content)
+SELECT 'two beta common term doc ' || i FROM generate_series(31, 60) AS i;
+SELECT bm25_spill_index('merge_drop_idx');
+
+-- Delete half the rows and VACUUM to flip dead bits in the two L0s.
+DELETE FROM merge_drop_dead WHERE id % 2 = 0;
+VACUUM merge_drop_dead;
+
+-- Third spill triggers compaction (segments_per_level=3); merge
+-- drops the bitset-dead docs.
+INSERT INTO merge_drop_dead (content)
+SELECT 'three gamma common term doc ' || i FROM generate_series(61, 90) AS i;
+SELECT bm25_spill_index('merge_drop_idx');
+
+-- 30 + 30 + 30 = 90 inserted; 30 deleted; 60 live.  Pre-fix merge
+-- would leave metap->total_docs at 90 (summed sources' num_docs
+-- unchanged), which violates total_docs = Σ segment.num_docs.
+SELECT bm25_summarize_index('merge_drop_idx') ~ E'total_docs: 60\n'
+    AS metap_matches_live_count;
+
+RESET pg_textsearch.segments_per_level;
+DROP TABLE merge_drop_dead;
+
+-- Clean up
+DROP EXTENSION pg_textsearch CASCADE;

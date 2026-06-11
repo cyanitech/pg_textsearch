@@ -1,0 +1,211 @@
+/*
+ * Copyright (c) 2025-2026 Tiger Data, Inc.
+ * Licensed under the PostgreSQL License. See LICENSE for details.
+ *
+ * am.h - BM25 access method shared definitions
+ */
+#pragma once
+
+#include <postgres.h>
+
+#include <access/amapi.h>
+#include <access/reloptions.h>
+#include <storage/block.h>
+#include <storage/bufpage.h>
+#include <tsearch/ts_type.h>
+
+#include "index/state.h"
+#include "types/vector.h"
+
+/*
+ * BM25 scan opaque data - internal state for index scans
+ */
+typedef struct TpScanOpaqueData
+{
+	MemoryContext scan_context; /* Memory context for scan */
+
+	/* Query processing state */
+	char	 *query_text;	/* Search query text */
+	TpVector *query_vector; /* Original query vector from ORDER BY */
+	Oid		  index_oid;	/* Index OID */
+
+	/* Scan results state */
+	ItemPointer result_ctids;  /* Array of matching CTIDs */
+	float4	   *result_scores; /* Array of BM25 scores */
+	int			result_count;  /* Number of results */
+	int			current_pos;   /* Current position in results */
+	bool		eof_reached;   /* End of scan flag */
+
+	/* LIMIT optimization */
+	int limit;			  /* Query LIMIT value, -1 if none */
+	int max_results_used; /* Internal limit used for current batch */
+} TpScanOpaqueData;
+
+typedef TpScanOpaqueData *TpScanOpaque;
+
+/* Index options structure */
+typedef struct TpOptions
+{
+	int32  vl_len_;			   /* varlena header (do not touch directly!) */
+	int32  text_config_offset; /* offset to text config string */
+	double k1;				   /* BM25 k1 parameter */
+	double b;				   /* BM25 b parameter */
+} TpOptions;
+
+/* Tapir-specific build phases for progress reporting */
+#define TP_PHASE_LOADING	2
+#define TP_PHASE_WRITING	3
+#define TP_PHASE_COMPACTING 4
+
+/* Progress reporting interval (tuples) */
+#define TP_PROGRESS_REPORT_INTERVAL 1000
+
+/* Forward declarations */
+struct IndexInfo;
+struct PlannerInfo;
+struct IndexPath;
+struct IndexVacuumInfo;
+struct IndexBulkDeleteResult;
+struct IndexBuildResult;
+
+/*
+ * Shared utility functions
+ */
+
+/* Cached score for ORDER BY optimization */
+float8 tp_get_cached_score(void);
+
+/*
+ * Access method handler
+ */
+Datum tp_handler(PG_FUNCTION_ARGS);
+
+/*
+ * Build utilities (am/build.c)
+ */
+
+/* Link a segment as the new L0 chain head in the metapage */
+void tp_link_l0_chain_head(Relation index, BlockNumber segment_root);
+
+/* Truncate dead pages by walking segment chains for max used block */
+void tp_truncate_dead_pages(Relation index);
+
+/*
+ * Build functions (am/build.c)
+ */
+struct IndexBuildResult		 *
+tp_build(Relation heap, Relation index, struct IndexInfo *indexInfo);
+void tp_buildempty(Relation index);
+bool tp_insert(
+		Relation		  index,
+		Datum			 *values,
+		bool			 *isnull,
+		ItemPointer		  ht_ctid,
+		Relation		  heapRel,
+		IndexUniqueCheck  checkUnique,
+		bool			  indexUnchanged,
+		struct IndexInfo *indexInfo);
+
+/* Shared document processing function */
+bool tp_process_document_text(
+		text			  *document_text,
+		ItemPointer		   ctid,
+		Oid				   text_config_oid,
+		TpLocalIndexState *index_state,
+		Relation		   index_rel,
+		int32			  *doc_length_out);
+
+/* Extract terms and frequencies from a TSVector */
+int tp_extract_terms_from_tsvector(
+		TSVector tsvector,
+		char  ***terms_out,
+		int32  **frequencies_out,
+		int		*term_count_out);
+
+/*
+ * Tokenize a document into terms and frequencies. Handles documents whose
+ * lexeme volume would otherwise exceed Postgres's tsvector 1 MB cap by
+ * splitting on whitespace and merging per-chunk results.
+ *
+ * Output arrays are palloc'd in the current memory context. Returns
+ * doc_length (sum of frequencies).
+ */
+int tp_tokenize_text(
+		text   *document_text,
+		Oid		text_config_oid,
+		char ***terms_out,
+		int32 **frequencies_out,
+		int	   *term_count_out);
+
+/* Build progress tracking for partitioned tables */
+void tp_build_progress_begin(void);
+void tp_build_progress_end(void);
+
+/*
+ * Scan functions (am/scan.c)
+ */
+IndexScanDesc tp_beginscan(Relation index, int nkeys, int norderbys);
+void		  tp_rescan(
+				 IndexScanDesc scan,
+				 ScanKey	   keys,
+				 int		   nkeys,
+				 ScanKey	   orderbys,
+				 int		   norderbys);
+void tp_endscan(IndexScanDesc scan);
+bool tp_gettuple(IndexScanDesc scan, ScanDirection dir);
+
+/*
+ * Vacuum functions (am/vacuum.c)
+ */
+struct IndexBulkDeleteResult *tp_bulkdelete(
+		struct IndexVacuumInfo		 *info,
+		struct IndexBulkDeleteResult *stats,
+		IndexBulkDeleteCallback		  callback,
+		void						 *callback_state);
+struct IndexBulkDeleteResult *tp_vacuumcleanup(
+		struct IndexVacuumInfo *info, struct IndexBulkDeleteResult *stats);
+char *tp_buildphasename(int64 phase);
+
+/*
+ * Spill a memtable to an L0 segment.  Skips when
+ * chain_page_count < min_pages.  Acquires LW_EXCLUSIVE internally.
+ */
+void tp_spill_memtable_if_needed(
+		Relation index, TpLocalIndexState *index_state, uint32 min_pages);
+
+/*
+ * Recycle memtable pages stamped DEAD during spill: scan the index
+ * main fork, RecordFreeIndexPage when dead_fxid is older than the
+ * global visibility horizon for heaprel.  Returns the number of
+ * blocks freed.  Caller must hold per-index LW_SHARED or stronger
+ * (tp_vacuumcleanup).  FSM updates are not WAL-logged (same as
+ * segment page free).
+ */
+int tp_reclaim_dead_memtable_pages(Relation indexrel, Relation heaprel);
+
+/*
+ * Spill the current index's memtable to a disk segment.
+ * Returns true if a segment was written or chain stats were applied.
+ * If `out_segment_root` is non-NULL and a segment was emitted (not
+ * solely a doc-length update), it receives the BlockNumber of the
+ * new L0 segment header *before* any subsequent L0->L1 compaction;
+ * otherwise it is set to InvalidBlockNumber.
+ *
+ * Caller must already hold LW_EXCLUSIVE on the per-index lock.
+ */
+bool tp_do_spill(
+		TpLocalIndexState *index_state,
+		Relation		   index_rel,
+		BlockNumber		  *out_segment_root);
+
+/*
+ * Handler functions (am/handler.c)
+ */
+bytea *tp_options(Datum reloptions, bool validate);
+bool   tp_validate(Oid opclassoid);
+
+/* Relation options kind - initialized in mod.c */
+extern relopt_kind tp_relopt_kind;
+
+/* Debug GUC: trigger PANIC after spill finalize for crash-safety testing */
+extern bool tp_debug_panic_after_spill_finalize;

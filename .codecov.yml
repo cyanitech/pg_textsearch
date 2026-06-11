@@ -1,0 +1,27 @@
+# Codecov configuration for pg_textsearch
+# https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  precision: 2
+  round: down
+  range: "50...90"
+
+  status:
+    project:
+      default:
+        target: 85%
+        threshold: 1%
+    patch:
+      default:
+        informational: true
+
+# Ignore test files in coverage reports
+ignore:
+  - "test/**"
+  - "benchmarks/**"
+
+# Comment settings for PRs
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: true

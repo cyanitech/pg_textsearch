@@ -1,0 +1,40 @@
+# LeakSanitizer suppressions for pg_textsearch tests
+#
+# These suppress known PostgreSQL internal allocations that are
+# intentionally long-lived and not actual memory leaks.
+
+# PostgreSQL memory contexts - allocations live for process lifetime
+leak:AllocSetContextCreate
+leak:MemoryContextAlloc
+leak:palloc
+leak:repalloc
+
+# PostgreSQL frontend utilities (pg_config, etc.) allocate memory and
+# exit without freeing - normal for short-lived command-line tools
+leak:pg_strdup
+leak:get_configdata
+
+# OpenSSL one-time initialization
+leak:libssl
+leak:libcrypto
+
+# PostgreSQL GUC and catalog caches
+leak:GUC
+leak:CatalogCache
+
+# PostgreSQL process title (argv) saving - intentionally never freed
+leak:save_ps_display_args
+
+# PostgreSQL initdb - short-lived tool doesn't free memory before exit
+leak:escape_single_quotes_ascii
+leak:escape_quotes_bki
+leak:pretty_wal_size
+leak:pg_malloc_internal
+leak:setup_config
+leak:bootstrap_template1
+
+# System library allocations in short-lived tools
+leak:getaddrinfo
+
+# PostgreSQL server startup allocations - live for process lifetime
+leak:PostmasterMain

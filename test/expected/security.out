@@ -1,0 +1,106 @@
+-- Test security restrictions on debug and admin functions
+CREATE EXTENSION pg_textsearch;
+-- Create test data
+CREATE TABLE security_test (id serial, content text);
+INSERT INTO security_test (content) VALUES ('test document');
+CREATE INDEX security_test_idx ON security_test USING bm25(content) WITH (text_config='english');
+NOTICE:  BM25 index build started for relation security_test_idx
+NOTICE:  Using text search configuration: english
+NOTICE:  Using index options: k1=1.20, b=0.75
+NOTICE:  BM25 index build completed: 1 documents, avg_length=2.00
+-- Create a non-superuser role
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'test_nonsuperuser') THEN
+        EXECUTE 'REASSIGN OWNED BY test_nonsuperuser TO CURRENT_USER';
+        EXECUTE 'DROP OWNED BY test_nonsuperuser CASCADE';
+        DROP ROLE test_nonsuperuser;
+    END IF;
+END $$;
+CREATE ROLE test_nonsuperuser LOGIN;
+GRANT ALL ON TABLE security_test TO test_nonsuperuser;
+GRANT USAGE ON SCHEMA public TO test_nonsuperuser;
+-- Test as superuser / index owner (should all work)
+SELECT bm25_dump_index('security_test_idx') IS NOT NULL AS dump_works;
+ dump_works 
+------------
+ t
+(1 row)
+
+SELECT bm25_summarize_index('security_test_idx') IS NOT NULL AS summarize_works;
+ summarize_works 
+-----------------
+ t
+(1 row)
+
+SELECT bm25_spill_index('security_test_idx') IS NULL AS spill_works;
+ spill_works 
+-------------
+ t
+(1 row)
+
+SELECT bm25_force_merge('security_test_idx');
+ bm25_force_merge 
+------------------
+ 
+(1 row)
+
+-- Switch to non-superuser (not the index owner)
+SET ROLE test_nonsuperuser;
+-- Debug functions should fail (REVOKE blocks execution)
+SELECT bm25_dump_index('security_test_idx');
+ERROR:  permission denied for function bm25_dump_index
+SELECT bm25_summarize_index('security_test_idx');
+ERROR:  permission denied for function bm25_summarize_index
+-- Admin functions should fail with "must be owner"
+SELECT bm25_spill_index('security_test_idx');
+ERROR:  must be owner of index security_test_idx
+SELECT bm25_force_merge('security_test_idx');
+ERROR:  must be owner of index security_test_idx
+-- REVOKE should block non-superusers on debug functions
+SELECT has_function_privilege('test_nonsuperuser', 'bm25_dump_index(text)', 'EXECUTE') AS dump_priv;
+ dump_priv 
+-----------
+ f
+(1 row)
+
+SELECT has_function_privilege('test_nonsuperuser', 'bm25_summarize_index(text)', 'EXECUTE') AS summarize_priv;
+ summarize_priv 
+----------------
+ f
+(1 row)
+
+-- Resource-control GUCs should require superuser
+SET pg_textsearch.bulk_load_threshold = 1;
+ERROR:  permission denied to set parameter "pg_textsearch.bulk_load_threshold"
+SET pg_textsearch.memtable_pages_threshold = 0;
+ERROR:  permission denied to set parameter "pg_textsearch.memtable_pages_threshold"
+SET pg_textsearch.segments_per_level = 2;
+ERROR:  permission denied to set parameter "pg_textsearch.segments_per_level"
+-- Logging GUCs should require superuser (info disclosure in pooled envs)
+SET pg_textsearch.log_scores = on;
+ERROR:  permission denied to set parameter "pg_textsearch.log_scores"
+SET pg_textsearch.log_bmw_stats = on;
+ERROR:  permission denied to set parameter "pg_textsearch.log_bmw_stats"
+-- User-facing GUCs should still be settable
+SET pg_textsearch.default_limit = 500;
+SHOW pg_textsearch.default_limit;
+ pg_textsearch.default_limit 
+-----------------------------
+ 500
+(1 row)
+
+SET pg_textsearch.compress_segments = off;
+SHOW pg_textsearch.compress_segments;
+ pg_textsearch.compress_segments 
+---------------------------------
+ off
+(1 row)
+
+-- Reset to superuser
+RESET ROLE;
+-- Cleanup
+DROP TABLE security_test;
+DROP OWNED BY test_nonsuperuser CASCADE;
+DROP ROLE test_nonsuperuser;
+DROP EXTENSION pg_textsearch;
